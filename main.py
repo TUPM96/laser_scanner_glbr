@@ -5,6 +5,11 @@ import serial, serial.tools.list_ports
 import numpy as np
 import cv2
 
+TEXT_ENCODING = "utf-8"        # hoặc "utf-8-sig" nếu muốn Excel mở CSV chuẩn Unicode
+def open_txt(path, mode="w", *, encoding=TEXT_ENCODING, newline=""):
+    # Dùng cho tất cả file văn bản (không dùng cho nhị phân)
+    return open(path, mode, encoding=encoding, newline=newline)
+
 # --- optional aruco ---
 try:
     from cv2 import aruco
@@ -41,10 +46,8 @@ def poisson_reconstruct_from_points(V, depth=9, density_keep=0.10,
     """
     if not HAS_O3D:
         raise RuntimeError("Thiếu Open3D. Hãy cài: pip install open3d")
-
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(V)
-
     # Ước lượng normal
     pcd.estimate_normals(
         search_param=o3d.geometry.KDTreeSearchParamHybrid(
@@ -60,11 +63,9 @@ def poisson_reconstruct_from_points(V, depth=9, density_keep=0.10,
         pcd, depth=int(depth)
     )
     densities = np.asarray(densities)
-
     # lọc vùng loãng (bỏ ~10% mỏng nhất)
     keep = densities > np.quantile(densities, float(density_keep))
     mesh = mesh.select_by_index(np.where(keep)[0])
-
     # làm sạch topo
     mesh.remove_degenerate_triangles()
     mesh.remove_duplicated_triangles()
@@ -77,46 +78,65 @@ def poisson_reconstruct_from_points(V, depth=9, density_keep=0.10,
         raise RuntimeError("Poisson thất bại: không tạo được tam giác.")
     return Vout, Fout
 
-
 def write_lsdyna_k(vertices, faces, out_path,
-                   thickness=1.0, young=2.10e5, nu=0.3):
-    """
-    Ghi LS-DYNA keyword .k dạng SHELL:
-      *NODE, *SECTION_SHELL, *MAT_ELASTIC, *ELEMENT_SHELL
-    - vertices: (N,3) float mm
-    - faces: (M,3) int (0-based). Tam giác -> N4 lặp N3
-    """
-    if vertices is None or len(vertices) == 0:
-        raise RuntimeError("Vertices rỗng.")
-    if faces is None or len(faces) == 0:
-        raise RuntimeError("Faces rỗng. Cần lưới tam giác để xuất SHELL.")
+                   thickness=1.0,
+                   young=2.10e5,   # MPa
+                   nu=0.3,
+                   density=7.85e-9):  # ton/mm^3 cho hệ mm–ms–ton
+    import numpy as np
 
-    with open(out_path, "w") as f:
+    # -- kiểm tra an toàn --
+    if vertices is None or np.size(vertices) == 0:
+        raise RuntimeError("Vertices rỗng.")
+    if faces is None or np.size(faces) == 0:
+        raise RuntimeError("Faces rỗng.")
+
+    # -------- fixed SMALL-FIELD: 10 ký tự/field ----------
+    def I10(v):  return f"{int(v):10d}"
+    def F10(v):  return f"{float(v):10.3f}"     # toạ độ, độ dày (|v| < 10000 để không tràn)
+    def E10(v):  return f"{float(v):10.2E}"     # hằng số lớn/nhỏ (ra '  2.10E+05')
+
+    def wfix(f, fields):  # nối liền các field 10-ký-tự
+        f.write("".join(fields) + "\n")
+
+    pid, secid, mid = 1, 1, 1
+
+    with open_txt(out_path, "w") as f:
         f.write("*KEYWORD\n")
         f.write("*TITLE\n")
-        f.write("Scan→LS-DYNA shell mesh (units: mm)\n")
+        f.write("Scan -> LS-DYNA shell mesh (units: mm, ms, ton)\n")
 
-        # Nodes
-        f.write("*NODE\n")
-        for i, (x, y, z) in enumerate(vertices, start=1):
-            f.write(f"{i}, {x:.6f}, {y:.6f}, {z:.6f}\n")
+        # ----- PART -----
+        f.write("*PART\n")
+        f.write("scan_shell_part\n")
+        wfix(f, [I10(pid), I10(secid), I10(mid), I10(0)])
 
-        # Section & Material
-        pid = 1
-        mid = 1
+        # ----- SECTION_SHELL (2 dòng bắt buộc ở bản cũ) -----
         f.write("*SECTION_SHELL\n")
-        # PID, ELFORM, THICK
-        f.write(f"{pid}, , {float(thickness):.6f}\n")
+        # secid, elform=2, shrf=0.8333, nip=5
+        wfix(f, [I10(secid), I10(2), F10(0.8333), I10(5)])
+        # dòng 2: đặt 0.0
+        wfix(f, [F10(0.0)])
 
+        # ----- MAT_ELASTIC (mid, ro, E, nu) -----
         f.write("*MAT_ELASTIC\n")
-        # MID, E, NU
-        f.write(f"{mid}, {float(young):.6f}, {float(nu):.6f}\n")
+        wfix(f, [I10(mid), E10(density), E10(young), F10(nu)])
 
-        # Elements (tam giác -> N4 = N3)
+        # ----- NODE -----
+        f.write("*NODE\n")
+        V = np.asarray(vertices, dtype=float)
+        for i, (x, y, z) in enumerate(V, start=1):
+            # LƯU Ý: F10.3 => phạm vi ~[-9999.999, 9999.999]
+            wfix(f, [I10(i), F10(x), F10(y), F10(z)])
+
+        # ----- ELEMENT_SHELL -----
         f.write("*ELEMENT_SHELL\n")
-        for eid, (i1, i2, i3) in enumerate(faces, start=1):
-            n1, n2, n3 = int(i1) + 1, int(i2) + 1, int(i3) + 1
-            f.write(f"{eid}, {pid}, {n1}, {n2}, {n3}, {n3}\n")
+        F = np.asarray(faces, dtype=int)
+        t10 = F10(float(thickness))
+        for eid, (i1, i2, i3) in enumerate(F, start=1):
+            n1, n2, n3 = int(i1)+1, int(i2)+1, int(i3)+1
+            wfix(f, [I10(eid), I10(pid), I10(n1), I10(n2), I10(n3), I10(n3)])
+            wfix(f, [t10, t10, t10, t10])
 
         f.write("*END\n")
 
@@ -285,6 +305,7 @@ class CalibWorker:
         overlay = frame.copy()
         objp = None
         info = {}
+
         if self.pattern_type == "Chessboard":
             flags = (cv2.CALIB_CB_ADAPTIVE_THRESH +
                      cv2.CALIB_CB_FAST_CHECK +
@@ -299,6 +320,7 @@ class CalibWorker:
                 objp = self._build_objp_grid()
                 return True, corners2, overlay, objp, info
             return False, None, overlay, None, info
+
         elif self.pattern_type in ("Circles","Asym Circles"):
             pattern = (self.cols, self.rows)
             flags = cv2.CALIB_CB_SYMMETRIC_GRID
@@ -310,6 +332,7 @@ class CalibWorker:
                 objp = self._build_objp_grid()
                 return True, centers, overlay, objp, info
             return False, None, overlay, None, info
+
         elif self.pattern_type == "Charuco":
             if not HAS_ARUCO:
                 info["error"] = "Cần opencv-contrib-python cho ChArUco"
@@ -330,6 +353,7 @@ class CalibWorker:
                 info["charuco_ids"] = ch_ids
                 return True, ch_corners, overlay, objp, info
             return False, None, overlay, None, info
+
         else:
             return False, None, overlay, None, {"error":"Pattern không hỗ trợ"}
 
@@ -393,6 +417,7 @@ def ransac_line_py(points_xy, iters=300, tol=1.5, min_inliers=30):
             best_cnt = cnt; best_a, best_b, best_mask = a, b, mask
     if best_cnt < max(min_inliers, 2):
         return False, 0.0, 0.0, [False]*n
+
     xs, ys = [], []
     for k, (x, y) in enumerate(pts):
         if best_mask[k]: xs.append(float(x)); ys.append(float(y))
@@ -415,9 +440,13 @@ class App(tk.Tk):
         self.title("3D Scanner")
         self.geometry("1180x840")
         self.resizable(False, False)
+
         self.client = GlbrClient()
         self.cam = CalibWorker()
         self.status_poll_interval_ms = 250
+
+        # camera rotation (0,1,2,3) * 90°
+        self.cam_rot_k = 0  # 0=0°,1=90°,2=180°,3=270°
 
         # scan state
         self.scan_running = False
@@ -460,6 +489,10 @@ class App(tk.Tk):
         self._sim_tk = None
         self.tk_prev = None
         self.tk_prev_scan = None
+
+        # rotation labels
+        self.lbl_rot1 = None
+        self.lbl_rot2 = None
 
         self._build_ui()
         self._refresh_ports()
@@ -514,11 +547,14 @@ class App(tk.Tk):
 
         # ===== Tab 2: Calib =====
         calib = ttk.Frame(nb); nb.add(calib, text="Calib (Pattern → .npz)")
+
         cam_ctrl = ttk.LabelFrame(calib, text="Camera"); cam_ctrl.place(x=10, y=10, width=1130, height=80)
         ttk.Label(cam_ctrl, text="Index:").place(x=10, y=10)
         self.ent_cam_idx = ttk.Entry(cam_ctrl, width=5); self.ent_cam_idx.insert(0,"0"); self.ent_cam_idx.place(x=60,y=8)
         ttk.Button(cam_ctrl, text="Start", command=lambda: self._cam_start_with_idx(self.ent_cam_idx.get())).place(x=120, y=7, width=80)
         ttk.Button(cam_ctrl, text="Stop",  command=self._cam_stop ).place(x=210, y=7, width=80)
+        ttk.Button(cam_ctrl, text="Quay 90°", command=self._cam_rotate_90).place(x=300, y=7, width=100)
+        self.lbl_rot1 = ttk.Label(cam_ctrl, text="Góc: 0°"); self.lbl_rot1.place(x=410, y=10)
 
         patf = ttk.LabelFrame(calib, text="Pattern (giống Horus: set số ô)"); patf.place(x=10, y=100, width=700, height=140)
         ttk.Label(patf, text="Loại:").place(x=10, y=10)
@@ -529,11 +565,13 @@ class App(tk.Tk):
         self.ent_rows = ttk.Entry(patf, width=5); self.ent_rows.insert(0,"6");  self.ent_rows.place(x=140, y=43)
         ttk.Label(patf, text="Ô (mm):").place(x=190, y=45)
         self.ent_sq = ttk.Entry(patf, width=7); self.ent_sq.insert(0,"25.0"); self.ent_sq.place(x=240, y=43)
+
         ttk.Label(patf, text="Aruco dict:").place(x=10, y=80)
         self.cmb_dict = ttk.Combobox(patf, values=[
             "DICT_4X4_50","DICT_5X5_50","DICT_6X6_50","DICT_ARUCO_ORIGINAL"
         ], state="readonly", width=18)
         self.cmb_dict.current(1); self.cmb_dict.place(x=90, y=78)
+
         ttk.Label(patf, text="Charuco square/mm:").place(x=260, y=80)
         self.ent_ch_sq = ttk.Entry(patf, width=7); self.ent_ch_sq.insert(0,"25.0"); self.ent_ch_sq.place(x=400, y=78)
         ttk.Label(patf, text="marker/mm:").place(x=460, y=80)
@@ -562,18 +600,23 @@ class App(tk.Tk):
 
         # ===== Tab 3: Scan 3D =====
         scan = ttk.Frame(nb); nb.add(scan, text="Scan 3D (2 Laser + RANSAC)")
+
         cam2 = ttk.LabelFrame(scan, text="Camera"); cam2.place(x=10, y=10, width=1130, height=100)
 
-        # >>> Thêm chọn Index ở TAB 3 <<<
+        # Index ở TAB 3
         ttk.Label(cam2, text="Index:").place(x=10, y=12)
         self.ent_cam_idx3 = ttk.Entry(cam2, width=5); self.ent_cam_idx3.insert(0, "0"); self.ent_cam_idx3.place(x=60, y=10)
         ttk.Button(cam2, text="Start cam", command=lambda: self._cam_start_with_idx(self.ent_cam_idx3.get())).place(x=120, y=8, width=100)
         ttk.Button(cam2, text="Stop cam",  command=self._cam_stop).place(x=230, y=8, width=100)
 
+        ttk.Button(cam2, text="Quay 90°", command=self._cam_rotate_90).place(x=340, y=8, width=100)
+        self.lbl_rot2 = ttk.Label(cam2, text="Góc: 0°")
+        self.lbl_rot2.place(x=450, y=12)
+
         self.lbl_spin = ttk.Label(cam2, text="Bàn quay: (chưa đo)", font=("Segoe UI",9,"bold"))
-        self.lbl_spin.place(x=360, y=12)
+        self.lbl_spin.place(x=560, y=12)
         self.var_auto_angle = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cam2, text="Ước lượng góc tự động", variable=self.var_auto_angle).place(x=360, y=40)
+        ttk.Checkbutton(cam2, text="Ước lượng góc tự động", variable=self.var_auto_angle).place(x=560, y=40)
 
         laserf = ttk.LabelFrame(scan, text="Laser HSV (2 kênh)"); laserf.place(x=10, y=110, width=740, height=135)
         ttk.Label(laserf, text="Laser1 H:[").place(x=10, y=10)
@@ -756,6 +799,32 @@ class App(tk.Tk):
     def _cam_stop(self):
         self.cam.stop(); self._log("[CAM] Stopped")
 
+    def _cam_rotate_90(self):
+        """Mỗi lần bấm xoay 90° theo chiều kim đồng hồ."""
+        self.cam_rot_k = (self.cam_rot_k + 1) % 4
+        self._update_rot_labels()
+        self._log(f"[CAM] Rotate view → {self.cam_rot_k*90}°")
+
+    def _update_rot_labels(self):
+        deg = self.cam_rot_k * 90
+        if self.lbl_rot1 is not None:
+            self.lbl_rot1.config(text=f"Góc: {deg}°")
+        if self.lbl_rot2 is not None:
+            self.lbl_rot2.config(text=f"Góc: {deg}°")
+
+    def _apply_cam_rotation(self, frame):
+        """Xoay frame theo self.cam_rot_k * 90° và cập nhật self.cam.frame_size tương ứng."""
+        k = self.cam_rot_k % 4
+        if k == 1:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif k == 2:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif k == 3:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        # cập nhật frame_size theo khung sau xoay để calib và pipeline dùng đúng kích thước
+        self.cam.frame_size = (frame.shape[1], frame.shape[0])
+        return frame
+
     # ---------- Calib Tab handlers ----------
     def _calib_add(self):
         if not self.cam.running:
@@ -764,6 +833,7 @@ class App(tk.Tk):
         frame = self.cam.read()
         if frame is None:
             messagebox.showwarning("Camera", "Không có frame"); return
+        frame = self._apply_cam_rotation(frame)
         ok, overlay, info = self.cam.add_frame(frame)
         if ok:
             self._log("[CALIB] Thêm khung OK")
@@ -801,7 +871,8 @@ class App(tk.Tk):
             self.cam.aruco_dict_name = self.cmb_dict.get()
             self.cam.charuco_square_mm = float(self.ent_ch_sq.get())
             self.cam.charuco_marker_mm = float(self.ent_ch_mk.get())
-        except: pass
+        except:
+            pass
 
     # ----- AUTO collect like Horus -----
     def _auto_start(self):
@@ -832,10 +903,13 @@ class App(tk.Tk):
                 attempts += 1
                 self._log(f"[AUTO] Lỗi move X (attempt {attempts}): {e}. Sẽ thử lại…")
                 time.sleep(retry_sleep); continue
+
             time.sleep(max(self.auto_delay_ms, 0) / 1000.0)
             frame = self.cam.read()
             if frame is None:
                 self._log("[AUTO] Không có frame camera, bỏ qua lần này."); continue
+            frame = self._apply_cam_rotation(frame)
+
             self._update_pattern_params()
             ok, overlay, info = self.cam.add_frame(frame)
             if ok:
@@ -889,6 +963,7 @@ class App(tk.Tk):
         acc_x = 0.0
         for i in range(self.scan_frames_target):
             if not self.scan_running: break
+
             if self.scan_turntable:
                 time.sleep(0.05)
                 angle_deg = (self.spin_total_angle if self.var_auto_angle.get() else i * self.scan_deg_per_frame)
@@ -903,6 +978,7 @@ class App(tk.Tk):
             frame = self.cam.read()
             if frame is None:
                 self._log("[SCAN] Không có frame"); continue
+            frame = self._apply_cam_rotation(frame)
 
             # khởi tạo tham số tái tạo thô lần đầu
             if self.recon_cx is None:
@@ -918,10 +994,8 @@ class App(tk.Tk):
 
             # cập nhật dải mesh (2D)
             self._mesh_add_frame(i, l1_pts, l2_pts, frame.shape[:2])
-
             # cập nhật mô phỏng bàn xoay + vật (top-view)
             self._sim_add_points(angle_deg, l1_pts, l2_pts, frame.shape[:2])
-
             # hiển thị vùng phải theo chế độ
             self._refresh_right_view()
 
@@ -945,35 +1019,43 @@ class App(tk.Tk):
             else:
                 self.lbl_scan_info.after(0, lambda s=i+1, t=tot_pts, x=acc_x:
                     self.lbl_scan_info.config(text=f"Frames: {s} | Điểm: {t} | X={x:.3f}mm"))
+
         self.scan_running = False
         self._log("[SCAN] Kết thúc quét.")
         # cập nhật 3D cuối cùng khi kết thúc
         if self.var_view_3d.get():
             self._v3d_set_points(self._collect_pointcloud_mm())
-        # đề nghị xuất ngay (giữ nguyên như cũ, để riêng .k có nút riêng)
+        # đề nghị xuất ngay
         if self.scan_data and messagebox.askyesno("Xuất điểm 3D", "Xuất .PLY/.OBJ ngay bây giờ?"):
             try: self._export_ply_obj()
             except Exception as e: messagebox.showerror("Xuất 3D", str(e))
 
     def _process_two_lasers(self, frame_bgr):
         hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+
         def clamp(v, lo, hi): return max(lo, min(hi, int(v)))
+
         def mask_from_vars(hl, hh, sl, sh, vl, vh):
             low  = (clamp(hl,0,179), clamp(sl,0,255), clamp(vl,0,255))
             high = (clamp(hh,0,179), clamp(sh,0,255), clamp(vh,0,255))
             return cv2.inRange(hsv, low, high)
+
         m1 = mask_from_vars(self.l1_hl.get(), self.l1_hh.get(), self.l1_sl.get(), self.l1_sh.get(), self.l1_vl.get(), self.l1_vh.get())
         m2 = mask_from_vars(self.l2_hl.get(), self.l2_hh.get(), self.l2_sl.get(), self.l2_sh.get(), self.l2_vl.get(), self.l2_vh.get())
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
         m1 = cv2.morphologyEx(m1, cv2.MORPH_OPEN, k, iterations=1); m1 = cv2.dilate(m1, k, iterations=1)
         m2 = cv2.morphologyEx(m2, cv2.MORPH_OPEN, k, iterations=1); m2 = cv2.dilate(m2, k, iterations=1)
+
         overlay = frame_bgr.copy()
+
         def nz_points(mask):
             nz = cv2.findNonZero(mask)
             if nz is None: return []
             return [(int(p[0][0]), int(p[0][1])) for p in nz]
+
         pts1 = nz_points(m1); pts2 = nz_points(m2)
         out1 = None; out2 = None
+
         if len(pts1) > 0:
             ok, a, b, imask = ransac_line_py(pts1, iters=250, tol=1.5, min_inliers=30)
             if ok:
@@ -985,6 +1067,7 @@ class App(tk.Tk):
                     if imask[idx]:
                         x,y = pts1[idx]; out1.append((x,y))
                         cv2.circle(overlay, (x,y), 1, (0,200,0), -1)
+
         if len(pts2) > 0:
             ok, a, b, imask = ransac_line_py(pts2, iters=250, tol=1.5, min_inliers=30)
             if ok:
@@ -996,6 +1079,7 @@ class App(tk.Tk):
                     if imask[idx]:
                         x,y = pts2[idx]; out2.append((x,y))
                         cv2.circle(overlay, (x,y), 1, (200,0,0), -1)
+
         return overlay, out1, out2
 
     # ========== Mesh dải & Mô phỏng top-view ==========
@@ -1009,7 +1093,9 @@ class App(tk.Tk):
         Hmesh, Wmesh = self.mesh_img.shape[:2]
         if step_idx < 0 or step_idx >= Wmesh: return
         Hsrc = frame_hw[0]
+
         def map_y(y): return int(min(Hmesh-1, max(0, y * (Hmesh-1) / max(1, Hsrc-1))))
+
         if l1_pts:
             for (x,y) in l1_pts:
                 self.mesh_img[map_y(y), step_idx] = (0,255,0)
@@ -1029,6 +1115,7 @@ class App(tk.Tk):
         W, H = 540, 360
         if self.sim_img is None:
             self.sim_img = np.zeros((H, W, 3), dtype=np.uint8)
+
         # đọc tham số
         try:
             self.table_radius_mm = float(self.ent_table_r.get() or self.table_radius_mm)
@@ -1037,19 +1124,23 @@ class App(tk.Tk):
             self.recon_mm_per_px_x = float(self.ent_mmpx_x.get() or self.recon_mm_per_px_x)
             self.recon_mm_per_px_y = float(self.ent_mmpx_y.get() or self.recon_mm_per_px_y)
         except: pass
+
         if self.recon_cx is None: return  # chờ frame đầu để có kích thước
         try:
             if self.ent_cx.get().strip(): self.recon_cx = float(self.ent_cx.get())
             if self.ent_y0.get().strip(): self.recon_y0 = float(self.ent_y0.get())
         except: pass
+
         # scale mm->px trong ảnh mô phỏng
         Rpx = int(min(W, H)//2 - 8)
         mm2px = Rpx / max(1e-6, self.table_radius_mm)
         cx = W//2; cz = H//2
+
         # vẽ nền: bàn xoay
         self.sim_img[:] = (20,20,20)
         cv2.circle(self.sim_img, (cx, cz), Rpx, (60,60,60), thickness=2)
         cv2.circle(self.sim_img, (cx, cz), 2, (80,80,80), -1)
+
         def add_list(pts, color_bgr):
             if not pts: return
             if angle_deg is None: return
@@ -1064,6 +1155,7 @@ class App(tk.Tk):
                 zpix = int(cz + Z * mm2px)
                 if 0 <= xpix < W and 0 <= zpix < H:
                     self.sim_img[zpix, xpix] = color_bgr
+
         add_list(l1_pts, (0,255,0))
         if self.use_laser2_also:
             add_list(l2_pts, (255,0,0))
@@ -1160,7 +1252,8 @@ class App(tk.Tk):
     def _v3d_on_wheel(self, ev):
         if not self.var_view_3d.get(): return
         if ev.delta > 0: self._v3d_zoom *= 1.1
-        else:            self._v3d_zoom /= 1.1
+        else:
+            self._v3d_zoom /= 1.1
         self._v3d_zoom = max(0.1, min(10.0, self._v3d_zoom))
         self._v3d_redraw()
 
@@ -1179,38 +1272,47 @@ class App(tk.Tk):
                                             filetypes=[("NumPy","*.npz")],
                                             initialfile="scan_raw_ransac.npz")
         if not path: return
+
         steps = np.array([d["x_pos"] for d in self.scan_data], dtype=np.float32)
         tss   = np.array([d["ts"] for d in self.scan_data], dtype=np.float64)
+
         def arr_or_empty_list(lst):
             if not lst: return np.empty((0,2), dtype=np.float32)
             a = np.array(lst, dtype=np.float32)
             return a if a.size else np.empty((0,2), dtype=np.float32)
+
         l1 = [arr_or_empty_list(d["laser1"]) for d in self.scan_data]
         l2 = [arr_or_empty_list(d["laser2"]) for d in self.scan_data]
         angles = np.array([ (d.get("angle_deg", np.nan)) for d in self.scan_data ], dtype=np.float32)
+
         np.savez(path, steps=steps, tss=tss, angles=angles,
                  laser1=np.array(l1, dtype=object), laser2=np.array(l2, dtype=object))
         self._log(f"[SCAN] Đã lưu: {path}")
 
     def _scan_save_csv(self):
         if not self.scan_data:
-            messagebox.showwarning("Lưu", "Chưa có dữ liệu quét."); return
+            messagebox.showwarning("Lưu", "Chưa có dữ liệu quét.");
+            return
         path = filedialog.asksaveasfilename(defaultextension=".csv",
-                                            filetypes=[("CSV","*.csv")],
+                                            filetypes=[("CSV", "*.csv")],
                                             initialfile="scan_raw_ransac.csv")
         if not path: return
-        with open(path, "w", newline="") as f:
+        with open_txt(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["frame_idx","x_pos_mm","ts","angle_deg","laser_id","x_pix","y_pix"])
+            w.writerow(["frame_idx", "x_pos_mm", "ts", "angle_deg", "laser_id", "x_pix", "y_pix"])
             for d in self.scan_data:
-                i = d["step_idx"]; xp = d["x_pos"]; ts = d["ts"]; ang = d.get("angle_deg", float("nan"))
+                i = d["step_idx"];
+                xp = d["x_pos"];
+                ts = d["ts"];
+                ang = d.get("angle_deg", float("nan"))
                 for lid, arr in [(1, d["laser1"]), (2, d["laser2"])]:
                     if not arr: continue
-                    for (x,y) in arr:
+                    for (x, y) in arr:
                         w.writerow([i, f"{xp:.5f}", f"{ts:.6f}",
-                                    ("" if (ang!=ang) else f"{ang:.5f}"),
+                                    ("" if (ang != ang) else f"{ang:.5f}"),
                                     lid, int(x), int(y)])
         self._log(f"[SCAN] Đã lưu: {path}")
+
 
     def _collect_pointcloud_mm(self):
         """Chuyển dữ liệu quét thành point cloud (mm) theo phép chiếu trụ tròn thô."""
@@ -1227,11 +1329,13 @@ class App(tk.Tk):
             # fallback nếu cần
             self.recon_cx = self.recon_cx or 0.0
             self.recon_y0 = self.recon_y0 or 0.0
+
         for d in self.scan_data:
             ang = d.get("angle_deg", None)
             if ang is None: continue  # chỉ dựng với chế độ quay đế
             th = math.radians(float(ang))
             c, s = math.cos(th), math.sin(th)
+
             def add_pts(pts):
                 if not pts: return
                 for (xp, yp) in pts:
@@ -1241,39 +1345,46 @@ class App(tk.Tk):
                     Z = r_mm * s
                     Y = (float(self.recon_y0) - float(yp)) * self.recon_mm_per_px_y  # trục dọc lên trên
                     pc.append((X, Y, Z))
+
             add_pts(d.get("laser1"))
             if self.use_laser2_also: add_pts(d.get("laser2"))
         return pc
 
     def _export_ply_obj(self):
         if not self.scan_data:
-            messagebox.showwarning("Xuất 3D", "Chưa có dữ liệu quét."); return
+            messagebox.showwarning("Xuất 3D", "Chưa có dữ liệu quét.");
+            return
         pc = self._collect_pointcloud_mm()
         if not pc:
             messagebox.showwarning("Xuất 3D", "Không có điểm hợp lệ (kiểm tra góc/khung và tham số tái tạo).")
             return
         base = filedialog.asksaveasfilename(defaultextension=".ply",
-                                            filetypes=[("Point Cloud (*.ply)","*.ply"), ("OBJ (*.obj)","*.obj")],
+                                            filetypes=[("Point Cloud (*.ply)", "*.ply"), ("OBJ (*.obj)", "*.obj")],
                                             initialfile="scan_points.ply")
         if not base: return
         root, ext = os.path.splitext(base)
         ply_path = root + ".ply"
         obj_path = root + ".obj"
-        # --- PLY ASCII ---
-        with open(ply_path, "w") as f:
+
+        # PLY ASCII
+        with open_txt(ply_path, "w", encoding="utf-8") as f:
             f.write("ply\nformat ascii 1.0\n")
             f.write(f"element vertex {len(pc)}\n")
             f.write("property float x\nproperty float y\nproperty float z\n")
             f.write("end_header\n")
-            for (x,y,z) in pc:
+            for (x, y, z) in pc:
                 f.write(f"{x:.6f} {y:.6f} {z:.6f}\n")
-        # --- OBJ (chỉ vertex) ---
-        with open(obj_path, "w") as f:
+
+        # OBJ (chỉ vertex)
+        with open_txt(obj_path, "w", encoding="utf-8") as f:
             f.write("# simple point cloud as vertices only\n")
-            for (x,y,z) in pc:
+            for (x, y, z) in pc:
                 f.write(f"v {x:.6f} {y:.6f} {z:.6f}\n")
+
         self._log(f"[EXPORT] Đã lưu: {ply_path} và {obj_path}")
-        messagebox.showinfo("Xuất 3D", f"Đã lưu:\n{ply_path}\n{obj_path}\n\nMở bằng MeshLab/CloudCompare/Blender để chỉnh mesh (Poisson/ball pivot…).")
+        messagebox.showinfo("Xuất 3D",
+                            f"Đã lưu:\n{ply_path}\n{obj_path}\n\nMở bằng MeshLab/CloudCompare/Blender để chỉnh mesh (Poisson/ball pivot…).")
+
 
     def _export_lsdyna_k(self):
         """Xuất LS-DYNA .k từ point cloud:
@@ -1296,7 +1407,6 @@ class App(tk.Tk):
                                                 initialfile="scan_mesh.k")
         if not out_path:
             return
-
         try:
             V = np.asarray(pc, dtype=np.float64)
             # Poisson -> tam giác
@@ -1359,11 +1469,13 @@ class App(tk.Tk):
             self.spin_prev_pts = cv2.goodFeaturesToTrack(self.spin_prev_gray, maxCorners=200, qualityLevel=0.01, minDistance=8)
             if self.spin_prev_pts is None:
                 self.spin_prev_gray = gray; self.spin_prev_ts = now; return
+
         nxt_pts, st, err = cv2.calcOpticalFlowPyrLK(self.spin_prev_gray, gray, self.spin_prev_pts, None)
         if nxt_pts is None or st is None:
             self.spin_prev_gray = gray; self.spin_prev_ts = now
             self.spin_prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.01, minDistance=8)
             return
+
         p0 = self.spin_prev_pts[st==1]; p1 = nxt_pts[st==1]
         if len(p0) >= 10 and len(p1) >= 10:
             M, inliers = cv2.estimateAffinePartial2D(p0.reshape(-1,1,2), p1.reshape(-1,1,2),
@@ -1376,9 +1488,11 @@ class App(tk.Tk):
                 self.spin_ema_deg_per_s = 0.8*self.spin_ema_deg_per_s + 0.2*abs(omega_deg_s)
                 if self.var_auto_angle.get():
                     self.spin_total_angle += (angle_rad * 180.0 / math.pi)
+
         spinning = self.spin_ema_deg_per_s > 0.5
         txt = f"Bàn quay: {'ĐANG QUAY' if spinning else 'ĐỨNG YÊN'} | ω≈{self.spin_ema_deg_per_s:.2f} deg/s"
         self.lbl_spin.config(text=txt, foreground=("#2ecc71" if spinning else "#e74c3c"))
+
         self.spin_prev_gray = gray; self.spin_prev_ts = now
         self.spin_prev_pts = cv2.goodFeaturesToTrack(gray, maxCorners=200, qualityLevel=0.01, minDistance=8)
 
@@ -1388,6 +1502,7 @@ class App(tk.Tk):
             try: line = self.client.log_q.get_nowait()
             except queue.Empty: break
             else: self._log(line)
+
         # cập nhật state
         if self.client.last_status_line:
             info = parse_grbl_status(self.client.last_status_line)
@@ -1395,15 +1510,18 @@ class App(tk.Tk):
         if self.client.is_open():
             try: self.client.status()
             except: pass
+
         # live preview + monitor quay
         if self.cam.running:
             frame = self.cam.read()
             if frame is not None:
+                frame = self._apply_cam_rotation(frame)
                 ok, corners, overlay, _, info = self.cam.detect_pattern(frame)
                 self._push_preview(overlay if ok else frame)
                 if not self.scan_running:
                     self._push_scan_preview(frame)
                 self._update_spin_monitor(frame)
+
         self.after(self.status_poll_interval_ms, self._tick)
 
     def ent_feed_get(self):
