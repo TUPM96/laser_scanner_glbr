@@ -517,7 +517,7 @@ class App(tk.Tk):
         cam_ctrl = ttk.LabelFrame(calib, text="Camera"); cam_ctrl.place(x=10, y=10, width=1130, height=80)
         ttk.Label(cam_ctrl, text="Index:").place(x=10, y=10)
         self.ent_cam_idx = ttk.Entry(cam_ctrl, width=5); self.ent_cam_idx.insert(0,"0"); self.ent_cam_idx.place(x=60,y=8)
-        ttk.Button(cam_ctrl, text="Start", command=self._cam_start).place(x=120, y=7, width=80)
+        ttk.Button(cam_ctrl, text="Start", command=lambda: self._cam_start_with_idx(self.ent_cam_idx.get())).place(x=120, y=7, width=80)
         ttk.Button(cam_ctrl, text="Stop",  command=self._cam_stop ).place(x=210, y=7, width=80)
 
         patf = ttk.LabelFrame(calib, text="Pattern (giống Horus: set số ô)"); patf.place(x=10, y=100, width=700, height=140)
@@ -563,12 +563,17 @@ class App(tk.Tk):
         # ===== Tab 3: Scan 3D =====
         scan = ttk.Frame(nb); nb.add(scan, text="Scan 3D (2 Laser + RANSAC)")
         cam2 = ttk.LabelFrame(scan, text="Camera"); cam2.place(x=10, y=10, width=1130, height=100)
-        ttk.Button(cam2, text="Start cam", command=self._cam_start).place(x=10, y=10, width=100)
-        ttk.Button(cam2, text="Stop cam",  command=self._cam_stop).place(x=120, y=10, width=100)
+
+        # >>> Thêm chọn Index ở TAB 3 <<<
+        ttk.Label(cam2, text="Index:").place(x=10, y=12)
+        self.ent_cam_idx3 = ttk.Entry(cam2, width=5); self.ent_cam_idx3.insert(0, "0"); self.ent_cam_idx3.place(x=60, y=10)
+        ttk.Button(cam2, text="Start cam", command=lambda: self._cam_start_with_idx(self.ent_cam_idx3.get())).place(x=120, y=8, width=100)
+        ttk.Button(cam2, text="Stop cam",  command=self._cam_stop).place(x=230, y=8, width=100)
+
         self.lbl_spin = ttk.Label(cam2, text="Bàn quay: (chưa đo)", font=("Segoe UI",9,"bold"))
-        self.lbl_spin.place(x=240, y=12)
+        self.lbl_spin.place(x=360, y=12)
         self.var_auto_angle = tk.BooleanVar(value=False)
-        ttk.Checkbutton(cam2, text="Ước lượng góc tự động", variable=self.var_auto_angle).place(x=240, y=40)
+        ttk.Checkbutton(cam2, text="Ước lượng góc tự động", variable=self.var_auto_angle).place(x=360, y=40)
 
         laserf = ttk.LabelFrame(scan, text="Laser HSV (2 kênh)"); laserf.place(x=10, y=110, width=740, height=135)
         ttk.Label(laserf, text="Laser1 H:[").place(x=10, y=10)
@@ -732,10 +737,11 @@ class App(tk.Tk):
         except Exception as e:
             messagebox.showerror("Lỗi", str(e))
 
-    # ---------- Calib Tab handlers ----------
-    def _cam_start(self):
+    # ---------- Calib/Camera ----------
+    def _cam_start_with_idx(self, idx_str):
+        """Start camera với index truyền vào (dùng cho cả Tab 2 và Tab 3)."""
         try:
-            idx = int(self.ent_cam_idx.get())
+            idx = int(str(idx_str).strip())
             self.cam.start(idx)
             # reset quay monitor
             self.spin_prev_gray = None
@@ -750,6 +756,7 @@ class App(tk.Tk):
     def _cam_stop(self):
         self.cam.stop(); self._log("[CAM] Stopped")
 
+    # ---------- Calib Tab handlers ----------
     def _calib_add(self):
         if not self.cam.running:
             messagebox.showwarning("Camera","Hãy Start camera trước"); return
