@@ -1,7 +1,3 @@
-# glbr_x_gui.py
-# Điều khiển GLBR TRỤC X + tốc độ thấp để quét 3D; giữ nút laser (D12/D13).
-# Tab "Calib": pattern như Horus -> calib .npz
-# Tab "Scan 3D": 2 laser + RANSAC; mô phỏng bàn xoay; xuất .npz/.csv/.ply/.obj
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 import threading, time, queue, os, csv, random, math
@@ -316,7 +312,7 @@ def ransac_line_py(points_xy, iters=300, tol=1.5, min_inliers=30):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("GLBR X Controller + Laser + Calib + Scan3D")
+        self.title("3D Scanner")
         self.geometry("1180x840")
         self.resizable(False, False)
         self.client = GlbrClient()
