@@ -19,18 +19,114 @@ try:
 except Exception:
     HAS_PIL = False
 
+# --- optional Open3D cho mesh/poisson và ghi .k ---
+try:
+    import open3d as o3d
+    HAS_O3D = True
+except Exception:
+    HAS_O3D = False
+
 REALTIME_RESET      = b'\x18'
 REALTIME_FEED_HOLD  = b'!'
 REALTIME_CYCLE      = b'~'
 REALTIME_STATUS     = b'?'
 REALTIME_JOG_CANCEL = b'\x85'
 
+# ===================== LS-DYNA helpers (Poisson + ghi .k) =====================
+def poisson_reconstruct_from_points(V, depth=9, density_keep=0.10,
+                                   normal_radius=5.0, normal_max_nn=30):
+    """
+    V: (N,3) numpy float (mm). Trả về V,F tam giác (0-based).
+    depth lớn → lưới chi tiết hơn (nặng hơn).
+    """
+    if not HAS_O3D:
+        raise RuntimeError("Thiếu Open3D. Hãy cài: pip install open3d")
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(V)
+
+    # Ước lượng normal
+    pcd.estimate_normals(
+        search_param=o3d.geometry.KDTreeSearchParamHybrid(
+            radius=float(normal_radius), max_nn=int(normal_max_nn)
+        )
+    )
+    try:
+        pcd.orient_normals_consistent_tangent_plane(50)
+    except Exception:
+        pass
+
+    mesh, densities = o3d.geometry.TriangleMesh.create_from_point_cloud_poisson(
+        pcd, depth=int(depth)
+    )
+    densities = np.asarray(densities)
+
+    # lọc vùng loãng (bỏ ~10% mỏng nhất)
+    keep = densities > np.quantile(densities, float(density_keep))
+    mesh = mesh.select_by_index(np.where(keep)[0])
+
+    # làm sạch topo
+    mesh.remove_degenerate_triangles()
+    mesh.remove_duplicated_triangles()
+    mesh.remove_duplicated_vertices()
+    mesh.remove_non_manifold_edges()
+
+    Vout = np.asarray(mesh.vertices, dtype=np.float64)
+    Fout = np.asarray(mesh.triangles, dtype=np.int32)
+    if Fout.size == 0:
+        raise RuntimeError("Poisson thất bại: không tạo được tam giác.")
+    return Vout, Fout
+
+
+def write_lsdyna_k(vertices, faces, out_path,
+                   thickness=1.0, young=2.10e5, nu=0.3):
+    """
+    Ghi LS-DYNA keyword .k dạng SHELL:
+      *NODE, *SECTION_SHELL, *MAT_ELASTIC, *ELEMENT_SHELL
+    - vertices: (N,3) float mm
+    - faces: (M,3) int (0-based). Tam giác -> N4 lặp N3
+    """
+    if vertices is None or len(vertices) == 0:
+        raise RuntimeError("Vertices rỗng.")
+    if faces is None or len(faces) == 0:
+        raise RuntimeError("Faces rỗng. Cần lưới tam giác để xuất SHELL.")
+
+    with open(out_path, "w") as f:
+        f.write("*KEYWORD\n")
+        f.write("*TITLE\n")
+        f.write("Scan→LS-DYNA shell mesh (units: mm)\n")
+
+        # Nodes
+        f.write("*NODE\n")
+        for i, (x, y, z) in enumerate(vertices, start=1):
+            f.write(f"{i}, {x:.6f}, {y:.6f}, {z:.6f}\n")
+
+        # Section & Material
+        pid = 1
+        mid = 1
+        f.write("*SECTION_SHELL\n")
+        # PID, ELFORM, THICK
+        f.write(f"{pid}, , {float(thickness):.6f}\n")
+
+        f.write("*MAT_ELASTIC\n")
+        # MID, E, NU
+        f.write(f"{mid}, {float(young):.6f}, {float(nu):.6f}\n")
+
+        # Elements (tam giác -> N4 = N3)
+        f.write("*ELEMENT_SHELL\n")
+        for eid, (i1, i2, i3) in enumerate(faces, start=1):
+            n1, n2, n3 = int(i1) + 1, int(i2) + 1, int(i3) + 1
+            f.write(f"{eid}, {pid}, {n1}, {n2}, {n3}, {n3}\n")
+
+        f.write("*END\n")
+
+
 # ===================== Serial/GLBR (X only) =====================
 class GlbrClient:
     def __init__(self):
         self.ser = None
         self.rx_thread = None
-        self.rx_running = False
+               self.rx_running = False
         self.log_q = queue.Queue()
         self.state = "DISCONNECTED"
         self.last_status_line = ""
@@ -116,6 +212,7 @@ class GlbrClient:
         self.send_gcode("M9")
         self._set_spindle_dir(want_high=(invert_d13), smax=smax)
 
+
 # ===================== Helpers =====================
 def parse_grbl_status(line: str) -> dict:
     info = {"state":"UNKNOWN","fields":{}}
@@ -129,6 +226,7 @@ def parse_grbl_status(line: str) -> dict:
         else:
             info["fields"][p]=True
     return info
+
 
 # ===================== Camera / Calib worker =====================
 class CalibWorker:
@@ -272,6 +370,7 @@ class CalibWorker:
                  hsv_low=self.hsv_low, hsv_high=self.hsv_high)
         return path
 
+
 # ============ RANSAC (thuần Python) ============
 def ransac_line_py(points_xy, iters=300, tol=1.5, min_inliers=30):
     pts = list(points_xy)
@@ -307,6 +406,7 @@ def ransac_line_py(points_xy, iters=300, tol=1.5, min_inliers=30):
             b_ref = (sy - a_ref*sx) / m
             best_a, best_b = a_ref, b_ref
     return True, float(best_a), float(best_b), best_mask
+
 
 # ===================== GUI =====================
 class App(tk.Tk):
@@ -429,7 +529,6 @@ class App(tk.Tk):
         self.ent_rows = ttk.Entry(patf, width=5); self.ent_rows.insert(0,"6");  self.ent_rows.place(x=140, y=43)
         ttk.Label(patf, text="Ô (mm):").place(x=190, y=45)
         self.ent_sq = ttk.Entry(patf, width=7); self.ent_sq.insert(0,"25.0"); self.ent_sq.place(x=240, y=43)
-
         ttk.Label(patf, text="Aruco dict:").place(x=10, y=80)
         self.cmb_dict = ttk.Combobox(patf, values=[
             "DICT_4X4_50","DICT_5X5_50","DICT_6X6_50","DICT_ARUCO_ORIGINAL"
@@ -511,26 +610,28 @@ class App(tk.Tk):
         # Tái tạo thô (tham số sang 3D & mô phỏng)
         reconf = ttk.LabelFrame(scan, text="Tái tạo thô (top-view & xuất 3D)"); reconf.place(x=760, y=290, width=380, height=80)
         ttk.Label(reconf, text="Bán kính bàn (mm):").place(x=10, y=10)
-        self.ent_table_r = ttk.Entry(reconf, width=7); self.ent_table_r.insert(0, f"{self.table_radius_mm:g}")
+        self.ent_table_r = ttk.Entry(reconf, width=7); self.ent_table_r.insert(0, f"{60.0:g}")
         self.ent_table_r.place(x=130,y=8)
         ttk.Label(reconf, text="cx (px):").place(x=190, y=10)
         self.ent_cx = ttk.Entry(reconf, width=7); self.ent_cx.insert(0, "")
         self.ent_cx.place(x=240,y=8)
         ttk.Label(reconf, text="mm/px X,Y:").place(x=10, y=40)
-        self.ent_mmpx_x = ttk.Entry(reconf, width=7); self.ent_mmpx_x.insert(0, f"{self.recon_mm_per_px_x:g}")
+        self.ent_mmpx_x = ttk.Entry(reconf, width=7); self.ent_mmpx_x.insert(0, f"{0.10:g}")
         self.ent_mmpx_x.place(x=90, y=38)
-        self.ent_mmpx_y = ttk.Entry(reconf, width=7); self.ent_mmpx_y.insert(0, f"{self.recon_mm_per_px_y:g}")
+        self.ent_mmpx_y = ttk.Entry(reconf, width=7); self.ent_mmpx_y.insert(0, f"{0.10:g}")
         self.ent_mmpx_y.place(x=140, y=38)
         ttk.Label(reconf, text="y0 (px):").place(x=190, y=40)
         self.ent_y0 = ttk.Entry(reconf, width=7); self.ent_y0.insert(0, "")
         self.ent_y0.place(x=240, y=38)
 
+        # Xuất dữ liệu quét
         exportf = ttk.LabelFrame(scan, text="Xuất dữ liệu quét"); exportf.place(x=10, y=290, width=740, height=80)
         ttk.Button(exportf, text="Lưu .npz", command=self._scan_save_npz).place(x=20, y=15, width=120)
         ttk.Button(exportf, text="Lưu .csv", command=self._scan_save_csv).place(x=150, y=15, width=120)
         ttk.Button(exportf, text="Xuất .PLY/.OBJ", command=self._export_ply_obj).place(x=280, y=15, width=140)
+        ttk.Button(exportf, text="Xuất .K (LS-DYNA)", command=self._export_lsdyna_k).place(x=430, y=15, width=140)
         self.lbl_scan_info = ttk.Label(exportf, text="Frames quét: 0  |  Tổng điểm: 0")
-        self.lbl_scan_info.place(x=440, y=18)
+        self.lbl_scan_info.place(x=580, y=18)
 
         # Preview + Mô phỏng/3D
         prev3d = ttk.LabelFrame(scan, text="Preview camera  |  Top-view / 3D viewer (xoay bằng chuột)")
@@ -544,7 +645,6 @@ class App(tk.Tk):
                         variable=self.var_view_3d, command=self._refresh_right_view).place(x=580, y=10)
         self.cnv_right = tk.Canvas(prev3d, width=540, height=330, bg="#111111", highlightthickness=0)
         self.cnv_right.place(x=580, y=40)
-
         # bind chuột cho 3D viewer
         self.cnv_right.bind("<Button-1>", self._v3d_on_down)
         self.cnv_right.bind("<B1-Motion>", self._v3d_on_drag)
@@ -768,6 +868,7 @@ class App(tk.Tk):
         self.recon_cx = None
         self.recon_y0 = None
         if self.var_auto_angle.get(): self.spin_total_angle = 0.0
+
         self.scan_running = True
         self.scan_thread = threading.Thread(target=self._scan_worker, daemon=True)
         self.scan_thread.start()
@@ -810,8 +911,10 @@ class App(tk.Tk):
 
             # cập nhật dải mesh (2D)
             self._mesh_add_frame(i, l1_pts, l2_pts, frame.shape[:2])
+
             # cập nhật mô phỏng bàn xoay + vật (top-view)
             self._sim_add_points(angle_deg, l1_pts, l2_pts, frame.shape[:2])
+
             # hiển thị vùng phải theo chế độ
             self._refresh_right_view()
 
@@ -835,13 +938,12 @@ class App(tk.Tk):
             else:
                 self.lbl_scan_info.after(0, lambda s=i+1, t=tot_pts, x=acc_x:
                     self.lbl_scan_info.config(text=f"Frames: {s} | Điểm: {t} | X={x:.3f}mm"))
-
         self.scan_running = False
         self._log("[SCAN] Kết thúc quét.")
         # cập nhật 3D cuối cùng khi kết thúc
         if self.var_view_3d.get():
             self._v3d_set_points(self._collect_pointcloud_mm())
-        # đề nghị xuất ngay
+        # đề nghị xuất ngay (giữ nguyên như cũ, để riêng .k có nút riêng)
         if self.scan_data and messagebox.askyesno("Xuất điểm 3D", "Xuất .PLY/.OBJ ngay bây giờ?"):
             try: self._export_ply_obj()
             except Exception as e: messagebox.showerror("Xuất 3D", str(e))
@@ -909,7 +1011,6 @@ class App(tk.Tk):
                 self.mesh_img[map_y(y), step_idx] = (255,0,0)
 
     def _push_scan_mesh(self):
-        # (không còn dùng label riêng cho dải; vùng phải hiển thị top-view/3D)
         pass
 
     def _sim_reset(self):
@@ -998,7 +1099,6 @@ class App(tk.Tk):
         x2 =  x1*cy + z1*sy
         y2 =  y1
         z2 = -x1*sy + z1*cy
-
         # phối cảnh đơn giản (camera nhìn -Z, đặt ở z_cam)
         z_cam = 200.0   # mm
         f = 350.0       # px
@@ -1007,7 +1107,6 @@ class App(tk.Tk):
             return None
         u = f * (x2 / denom)
         v = f * (y2 / denom)
-
         # scale/zoom & tịnh tiến vào giữa canvas
         s = self._v3d_zoom
         cx, cy2 = W/2.0, H/2.0
@@ -1169,6 +1268,41 @@ class App(tk.Tk):
         self._log(f"[EXPORT] Đã lưu: {ply_path} và {obj_path}")
         messagebox.showinfo("Xuất 3D", f"Đã lưu:\n{ply_path}\n{obj_path}\n\nMở bằng MeshLab/CloudCompare/Blender để chỉnh mesh (Poisson/ball pivot…).")
 
+    def _export_lsdyna_k(self):
+        """Xuất LS-DYNA .k từ point cloud:
+           - Dựng mesh bằng Poisson (Open3D)
+           - Ghi *NODE/*ELEMENT_SHELL/*SECTION_SHELL/*MAT_ELASTIC
+        """
+        if not self.scan_data:
+            messagebox.showwarning("Xuất .K", "Chưa có dữ liệu quét."); return
+        pc = self._collect_pointcloud_mm()
+        if not pc:
+            messagebox.showwarning("Xuất .K", "Không có điểm hợp lệ (kiểm tra góc/khung và tham số tái tạo).")
+            return
+        if not HAS_O3D:
+            messagebox.showerror("Xuất .K", "Thiếu Open3D. Vui lòng cài: pip install open3d")
+            return
+
+        # Hỏi nơi lưu
+        out_path = filedialog.asksaveasfilename(defaultextension=".k",
+                                                filetypes=[("LS-DYNA Keyword","*.k")],
+                                                initialfile="scan_mesh.k")
+        if not out_path:
+            return
+
+        try:
+            V = np.asarray(pc, dtype=np.float64)
+            # Poisson -> tam giác
+            Vt, Ft = poisson_reconstruct_from_points(V, depth=9, density_keep=0.10,
+                                                     normal_radius=5.0, normal_max_nn=30)
+            # Ghi .k (tham số vật liệu/shell mặc định)
+            write_lsdyna_k(Vt, Ft, out_path,
+                           thickness=1.0, young=2.10e5, nu=0.3)
+            self._log(f"[LS-DYNA] Xuất .k OK: {out_path} | Vert={len(Vt)} Tri={len(Ft)}")
+            messagebox.showinfo("Xuất .K", f"Đã lưu:\n{out_path}\nVertices: {len(Vt)}\nTriangles: {len(Ft)}")
+        except Exception as e:
+            messagebox.showerror("Xuất .K", f"Lỗi: {e}")
+
     # ---------- UI helpers ----------
     def _log(self, s: str):
         self.txt.insert("end", s+"\n"); self.txt.see("end")
@@ -1268,6 +1402,7 @@ class App(tk.Tk):
     def ent_feed_get(self):
         try: return float(self.ent_feed.get())
         except: return 5.0
+
 
 if __name__ == "__main__":
     app = App()
