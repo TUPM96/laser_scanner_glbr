@@ -126,7 +126,7 @@ class GlbrClient:
     def __init__(self):
         self.ser = None
         self.rx_thread = None
-               self.rx_running = False
+        self.rx_running = False
         self.log_q = queue.Queue()
         self.state = "DISCONNECTED"
         self.last_status_line = ""
