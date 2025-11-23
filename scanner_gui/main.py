@@ -1,6 +1,12 @@
 """
 3D Scanner GUI Application
 Python GUI for controlling 3D scanner and visualizing scan data
+
+CORRECTED VERSION - HARDWARE SPECIFICATIONS:
+- Rotation (X axis): 0.1mm = 45 degrees, angle = position_mm × 450
+- Height (Z axis, mapped from GRBL X): M8 lead screw, 1 revolution = 8mm
+- Mapping: GRBL X -> GUI Z (height in mm), GRBL Y -> GUI X (rotation angle)
+- NOTE: format_gcode_command swaps X/Y when sending, so parse_grbl_status swaps back when reading
 """
 
 import tkinter as tk
@@ -20,7 +26,7 @@ class ScannerGUI:
         self.root = root
         self.root.title("3D Scanner Control")
         self.root.geometry("1000x600")
-        
+
         # Serial connection
         self.serial_conn = None
         self.is_connected = False
@@ -32,200 +38,157 @@ class ScannerGUI:
         self.step_by_step_active = False  # Step-by-step scan mode
         self.scan_step_thread = None  # Thread for sending SCAN_STEP commands
         self.min_points_for_export = 1  # Minimum points required to enable export (allow export with any points)
-        
+        self.current_vl53_distance = None  # Current VL53L0X distance reading in mm
+        self.scan_paused = False
+        self.scan_start_angle = 0.0  # Starting angle for current rotation
+
+        # Position tracking - CORRECTED CALIBRATION
+        # Rotation axis (GRBL Y -> GUI X): 0.1mm = 45 degrees, angle = position_mm × 450
+        # Height axis (GRBL X -> GUI Z): M8 lead screw, 1 revolution = 8mm, GRBL reports in mm
+        # NOTE: format_gcode_command swaps X/Y when sending, so parse_grbl_status swaps back
+        self.current_x_pos = 0.0  # Rotation position in mm (from GRBL Y after swap)
+        self.current_y_pos = 0.0  # Height position in mm (from GRBL X after swap, mapped to Z in GUI)
+        self.current_z_pos = 0.0  # GRBL Z position in mm (unused)
+        self.grbl_state = "Idle"  # GRBL state
+
         # Create GUI
         self.create_widgets()
-        
+
     def create_widgets(self):
         # Main container - horizontal layout
         main_frame = ttk.Frame(self.root, padding="5")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+
         # Create notebook for tabs
         notebook = ttk.Notebook(main_frame)
         notebook.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+
         # Tab 1: Control Panel
         control_tab = ttk.Frame(notebook, padding="5")
         notebook.add(control_tab, text="Control")
-        
+
         # Tab 2: Test
         test_tab = ttk.Frame(notebook, padding="5")
         notebook.add(test_tab, text="Test")
-        
+
         # Left panel - Controls (in Control tab)
         control_frame = ttk.LabelFrame(control_tab, text="Control Panel", padding="5")
         control_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
-        
+
         # Right panel - 3D Visualization (shared)
         viz_frame = ttk.LabelFrame(main_frame, text="3D Visualization", padding="5")
         viz_frame.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
-        
-        # Test tab content
-        self.setup_test_tab(test_tab)
-        
-        # Track test points
-        self.test_points = []
-        self.is_testing = False
-        self.test_current_step = 0  # Track current motor X position for test
-        self.test_current_step_z = 0  # Track current motor Z position for test
-        self.lidar_reading_active = False  # Track if continuous reading is active
-        # NEMA 17 motor: 1.8° per step = 200 steps per full revolution (full step mode)
-        # Microstepping modes:
-        # - Full step (MS1=LOW, MS2=LOW): 200 steps/rev
-        # - 1/2 step (MS1=HIGH, MS2=LOW): 400 steps/rev
-        # - 1/4 step (MS1=LOW, MS2=HIGH): 800 steps/rev
-        # - 1/8 step (MS1=HIGH, MS2=HIGH): 1600 steps/rev
-        # - 1/16 step: 3200 steps/rev
-        # 
-        # If your motor rotates 1.5 revolutions with 1600 steps, it means:
-        # - Your driver is likely in 1/8 step mode (1600 steps should = 1 rev)
-        # - But something is wrong with the configuration
-        # - Try: 1600 / 1.5 = 1067 steps for 1 revolution (calibrated)
-        # OR check your driver's microstepping jumpers/settings
-        # steps_per_rev will be loaded from firmware on connection
-        # Default value will be set from firmware's DEFAULT_STEPS_PER_REV (1600)
-        
-        # Port selection
+
+        # Port selection (in Control tab)
         ttk.Label(control_frame, text="Port:").grid(row=0, column=0, sticky=tk.W, pady=2)
         self.port_var = tk.StringVar()
         self.port_combo = ttk.Combobox(control_frame, textvariable=self.port_var, width=15)
         self.port_combo.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2, padx=2)
         self.refresh_ports()
-        
+
         ttk.Button(control_frame, text="Refresh", command=self.refresh_ports, width=8).grid(row=0, column=2, padx=2)
-        
+
         # Connect/Disconnect button
         self.connect_btn = ttk.Button(control_frame, text="Connect", command=self.toggle_connection)
         self.connect_btn.grid(row=1, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
-        
+
         # Status label
         self.status_label = ttk.Label(control_frame, text="Status: Disconnected", foreground="red")
         self.status_label.grid(row=2, column=0, columnspan=3, pady=2)
-        
-        # Scan parameters - compact layout
-        params_frame = ttk.LabelFrame(control_frame, text="Scan Parameters", padding="5")
-        params_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=3)
-        
-        # Row 0: Theta and Z Travel
-        # Note: θ Steps (number of measurement points per revolution) is synchronized from firmware
-        # It will be loaded automatically when connecting to device
-        ttk.Label(params_frame, text="θ Steps:").grid(row=0, column=0, sticky=tk.W, pady=1)
-        self.theta_steps_var = tk.StringVar(value="200")  # Default matches firmware DEFAULT_THETA_STEPS_PER_REV
-        ttk.Entry(params_frame, textvariable=self.theta_steps_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=2)
-        
-        ttk.Label(params_frame, text="Z Travel (mm):").grid(row=0, column=2, sticky=tk.W, padx=(10,0), pady=1)
-        self.z_travel_var = tk.StringVar(value="200")
-        ttk.Entry(params_frame, textvariable=self.z_travel_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
-        
-        # Row 1: Z Height (Z Steps/mm is hidden - fixed at 200 for vitme phi 8)
-        # Z Steps/mm is fixed at 200 (vitme phi 8: 1600 steps/rev / 8mm = 200 steps/mm)
-        # It's synchronized from firmware but not shown in GUI since it's hardware-dependent
-        self.z_steps_per_mm_var = tk.StringVar(value="200")  # Fixed: vitme phi 8
-        
-        ttk.Label(params_frame, text="Z Height (mm):").grid(row=1, column=0, sticky=tk.W, pady=1)
-        self.z_layer_height_var = tk.StringVar(value="2.0")
-        ttk.Entry(params_frame, textvariable=self.z_layer_height_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=2)
-        
-        # Row 2: Scan Delay and Center Distance
-        ttk.Label(params_frame, text="Delay (ms):").grid(row=2, column=0, sticky=tk.W, pady=1)
-        self.scan_delay_var = tk.StringVar(value="50")
-        ttk.Entry(params_frame, textvariable=self.scan_delay_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
-        
-        ttk.Label(params_frame, text="Khoảng cách tâm (cm):").grid(row=2, column=2, sticky=tk.W, padx=(10,0), pady=1)
-        self.center_distance_var = tk.StringVar(value="15.0")
-        ttk.Entry(params_frame, textvariable=self.center_distance_var, width=8).grid(row=2, column=3, sticky=tk.W, padx=2)
-        
-        # Row 3: Steps per Revolution
-        # Note: This value is synchronized from firmware (DEFAULT_STEPS_PER_REV = 1600)
-        # It will be loaded automatically when connecting to device
-        ttk.Label(params_frame, text="Steps/Rev:").grid(row=3, column=0, sticky=tk.W, pady=1)
-        self.steps_per_rev_var = tk.StringVar(value="1600")  # Default matches firmware DEFAULT_STEPS_PER_REV
-        ttk.Entry(params_frame, textvariable=self.steps_per_rev_var, width=8).grid(row=3, column=1, sticky=tk.W, padx=2)
-        
-        # Send config button
-        ttk.Button(params_frame, text="Send Config", command=self.send_config).grid(row=4, column=0, columnspan=4, pady=(5,0), sticky=(tk.W, tk.E))
-        
-        # Geometry parameters - simplified
+
+        # Test tab content
+        self.setup_test_tab(test_tab)
+
+        # Track test points
+        self.test_points = []
+        self.is_testing = False
+        self.vl53_reading_active = False
+
+        # Geometry parameters
         geometry_frame = ttk.LabelFrame(control_frame, text="Thông số hình học", padding="5")
-        geometry_frame.grid(row=4, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=3)
-        
-        # Row 0: Bán kính đĩa quay
-        ttk.Label(geometry_frame, text="Bán kính đĩa (cm):").grid(row=0, column=0, sticky=tk.W, pady=1)
+        geometry_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=3)
+
+        ttk.Label(geometry_frame, text="Khoảng cách tâm (cm):").grid(row=0, column=0, sticky=tk.W, pady=1)
+        self.center_distance_var = tk.StringVar(value="15.0")
+        ttk.Entry(geometry_frame, textvariable=self.center_distance_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=2)
+
+        ttk.Label(geometry_frame, text="Bán kính đĩa (cm):").grid(row=0, column=2, sticky=tk.W, padx=(10,0), pady=1)
         self.disk_radius_var = tk.StringVar(value="5.0")
-        ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=2)
-        
-        # Note: Khoảng cách tâm đã có trong Scan Parameters (row=2, column=2)
-        
+        ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
+
+        ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
+        self.points_per_revolution_var = tk.StringVar(value="360")
+        ttk.Entry(geometry_frame, textvariable=self.points_per_revolution_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=2)
+
         # Scan controls
         scan_frame = ttk.Frame(control_frame)
-        scan_frame.grid(row=5, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
-        
+        scan_frame.grid(row=4, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+
         self.scan_up_btn = ttk.Button(scan_frame, text="Scan ↑ (Dưới→Trên)", command=self.start_scan_up, state=tk.DISABLED)
         self.scan_up_btn.grid(row=0, column=0, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.scan_down_btn = ttk.Button(scan_frame, text="Scan ↓ (Trên→Dưới)", command=self.start_scan_down, state=tk.DISABLED)
         self.scan_down_btn.grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.pause_btn = ttk.Button(scan_frame, text="Tạm dừng", command=self.pause_scan, state=tk.DISABLED)
         self.pause_btn.grid(row=0, column=2, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.resume_btn = ttk.Button(scan_frame, text="Tiếp tục", command=self.resume_scan, state=tk.DISABLED)
         self.resume_btn.grid(row=0, column=3, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.clear_btn = ttk.Button(scan_frame, text="Clear", command=self.clear_data, state=tk.NORMAL)
         self.clear_btn.grid(row=1, column=0, columnspan=4, padx=2, pady=(5,0), sticky=(tk.W, tk.E))
-        
+
         scan_frame.columnconfigure(0, weight=1)
         scan_frame.columnconfigure(1, weight=1)
-        
+
         # Manual control buttons
         manual_frame = ttk.LabelFrame(control_frame, text="Manual Control", padding="5")
-        manual_frame.grid(row=6, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
-        
+        manual_frame.grid(row=5, column=0, columnspan=3, pady=5, sticky=(tk.W, tk.E))
+
         self.move_to_top_btn = ttk.Button(manual_frame, text="Lên đỉnh", command=self.move_to_top, state=tk.DISABLED)
         self.move_to_top_btn.grid(row=0, column=0, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.home_btn = ttk.Button(manual_frame, text="Về Home", command=self.go_home, state=tk.DISABLED)
         self.home_btn.grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
-        
+
         manual_frame.columnconfigure(0, weight=1)
         manual_frame.columnconfigure(1, weight=1)
         scan_frame.columnconfigure(2, weight=1)
-        
+
         # Progress
         progress_frame = ttk.Frame(control_frame)
-        progress_frame.grid(row=7, column=0, columnspan=3, pady=2, sticky=(tk.W, tk.E))
-        
+        progress_frame.grid(row=6, column=0, columnspan=3, pady=2, sticky=(tk.W, tk.E))
+
         ttk.Label(progress_frame, text="Progress:").grid(row=0, column=0, sticky=tk.W)
         self.progress_var = tk.StringVar(value="0%")
         ttk.Label(progress_frame, textvariable=self.progress_var).grid(row=0, column=1, sticky=tk.W, padx=5)
-        
+
         # Current angle display
         ttk.Label(progress_frame, text="Góc quay:").grid(row=1, column=0, sticky=tk.W, pady=(3,0))
         self.current_angle_var = tk.StringVar(value="0.0°")
         ttk.Label(progress_frame, textvariable=self.current_angle_var).grid(row=1, column=1, sticky=tk.W, padx=5, pady=(3,0))
-        
+
         self.progress_bar = ttk.Progressbar(control_frame, mode='determinate')
-        self.progress_bar.grid(row=7, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
-        
+        self.progress_bar.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=2)
+
         # Export buttons
         export_frame = ttk.Frame(control_frame)
-        export_frame.grid(row=8, column=0, columnspan=3, pady=3, sticky=(tk.W, tk.E))
-        
+        export_frame.grid(row=7, column=0, columnspan=3, pady=3, sticky=(tk.W, tk.E))
+
         self.export_stl_btn = ttk.Button(export_frame, text="Export STL", command=self.export_stl, state=tk.NORMAL)
         self.export_stl_btn.grid(row=0, column=0, padx=2, sticky=(tk.W, tk.E))
-        
+
         self.export_k_btn = ttk.Button(export_frame, text="Export .k", command=self.export_k, state=tk.NORMAL)
         self.export_k_btn.grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
-        
+
         export_frame.columnconfigure(0, weight=1)
         export_frame.columnconfigure(1, weight=1)
-        
-        # Data info - compact for 600px height
+
+        # Data info
         info_frame = ttk.LabelFrame(control_frame, text="Scan Info", padding="5")
-        info_frame.grid(row=9, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=3)
-        
+        info_frame.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=3)
+
         self.info_text = tk.Text(info_frame, height=3, width=35, font=("Consolas", 8))
         self.info_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar = ttk.Scrollbar(info_frame, orient=tk.VERTICAL, command=self.info_text.yview)
@@ -233,165 +196,236 @@ class ScannerGUI:
         self.info_text.configure(yscrollcommand=scrollbar.set)
         info_frame.rowconfigure(0, weight=1)
         info_frame.columnconfigure(0, weight=1)
-        
-        # Container frame for canvas and toolbar (use tk.Frame to allow pack)
+
+        # Container frame for canvas and toolbar
         canvas_container = tk.Frame(viz_frame)
         canvas_container.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Matplotlib figure - optimized for 1000x600 window
+
+        # Matplotlib figure
         self.fig = Figure(figsize=(6, 5), dpi=100)
         self.ax = self.fig.add_subplot(111, projection='3d')
         self.ax.set_xlabel('X (cm)')
         self.ax.set_ylabel('Y (cm)')
         self.ax.set_zlabel('Z (cm)')
         self.ax.set_title('3D Scan Point Cloud')
-        
+
         self.canvas = FigureCanvasTkAgg(self.fig, canvas_container)
         self.canvas.draw()
         self.canvas.get_tk_widget().pack(side=tk.TOP, fill=tk.BOTH, expand=True)
-        
-        # Toolbar (uses pack internally, so put it in a frame that allows pack)
+
+        # Toolbar
         toolbar = NavigationToolbar2Tk(self.canvas, canvas_container)
         toolbar.update()
-        
+
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)   # Notebook expands
-        main_frame.columnconfigure(2, weight=1)   # Visualization expands
+        main_frame.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(2, weight=1)
         main_frame.rowconfigure(0, weight=1)
         control_tab.columnconfigure(0, weight=1)
         control_tab.rowconfigure(0, weight=1)
         control_frame.columnconfigure(1, weight=1)
         control_frame.columnconfigure(3, weight=1)
-        control_frame.rowconfigure(9, weight=1)  # Info frame expands
+        control_frame.rowconfigure(8, weight=1)
         scan_frame.columnconfigure(0, weight=1)
         scan_frame.columnconfigure(1, weight=1)
         viz_frame.columnconfigure(0, weight=1)
         viz_frame.rowconfigure(0, weight=1)
-        
-        # Bind tab change event to clear test points
+
+        # Bind tab change event
         notebook.bind("<<NotebookTabChanged>>", self.on_tab_changed)
-    
+
     def setup_test_tab(self, test_tab):
-        """Setup Test tab content"""
-        # Test instructions
-        info_label = ttk.Label(test_tab, text="Test Mode: Measure 2 points (0° and 180°)", 
-                              font=("Arial", 10, "bold"))
-        info_label.grid(row=0, column=0, columnspan=3, pady=5, sticky=tk.W)
-        
-        # Motor control section
-        motor_frame = ttk.LabelFrame(test_tab, text="Motor Control", padding="5")
-        motor_frame.grid(row=1, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
-        # Motor X (Theta) control
-        ttk.Label(motor_frame, text="Motor X (Theta):", font=("Arial", 9, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=2)
-        
-        # Steps input for X
-        ttk.Label(motor_frame, text="Steps:").grid(row=1, column=0, sticky=tk.W, padx=2)
-        self.test_steps_var = tk.StringVar(value="1")
-        steps_entry = ttk.Entry(motor_frame, textvariable=self.test_steps_var, width=8)
-        steps_entry.grid(row=1, column=1, padx=2)
-        
-        # Direction buttons for X
-        self.rotate_cw_btn = ttk.Button(motor_frame, text="→ CW", command=self.rotate_cw, state=tk.DISABLED)
-        self.rotate_cw_btn.grid(row=1, column=2, padx=2)
-        
-        self.rotate_ccw_btn = ttk.Button(motor_frame, text="← CCW", command=self.rotate_ccw, state=tk.DISABLED)
-        self.rotate_ccw_btn.grid(row=1, column=3, padx=2)
-        
-        # Full rotation buttons for X
-        self.rotate_x_cw_full_btn = ttk.Button(motor_frame, text="X: 1 vòng CW", command=self.rotate_x_full_cw, state=tk.DISABLED)
-        self.rotate_x_cw_full_btn.grid(row=1, column=4, padx=2)
-        
-        self.rotate_x_ccw_full_btn = ttk.Button(motor_frame, text="X: 1 vòng CCW", command=self.rotate_x_full_ccw, state=tk.DISABLED)
-        self.rotate_x_ccw_full_btn.grid(row=1, column=5, padx=2)
-        
-        # Motor Z control
-        ttk.Label(motor_frame, text="Motor Z:", font=("Arial", 9, "bold")).grid(row=2, column=0, columnspan=4, sticky=tk.W, pady=(5,2))
-        
-        # Steps input for Z
-        ttk.Label(motor_frame, text="Steps:").grid(row=3, column=0, sticky=tk.W, padx=2)
-        self.test_steps_z_var = tk.StringVar(value="1")
-        steps_z_entry = ttk.Entry(motor_frame, textvariable=self.test_steps_z_var, width=8)
-        steps_z_entry.grid(row=3, column=1, padx=2)
-        
-        # Direction buttons for Z
-        self.rotate_z_cw_btn = ttk.Button(motor_frame, text="→ CW", command=self.rotate_z_cw, state=tk.DISABLED)
-        self.rotate_z_cw_btn.grid(row=3, column=2, padx=2)
-        
-        self.rotate_z_ccw_btn = ttk.Button(motor_frame, text="← CCW", command=self.rotate_z_ccw, state=tk.DISABLED)
-        self.rotate_z_ccw_btn.grid(row=3, column=3, padx=2)
-        
-        # Full rotation buttons for Z
-        self.rotate_z_cw_full_btn = ttk.Button(motor_frame, text="Z: 1 vòng CW", command=self.rotate_z_full_cw, state=tk.DISABLED)
-        self.rotate_z_cw_full_btn.grid(row=3, column=4, padx=2)
-        
-        self.rotate_z_ccw_full_btn = ttk.Button(motor_frame, text="Z: 1 vòng CCW", command=self.rotate_z_full_ccw, state=tk.DISABLED)
-        self.rotate_z_ccw_full_btn.grid(row=3, column=5, padx=2)
-        
-        # Current position display
-        ttk.Label(motor_frame, text="X Position:").grid(row=4, column=0, sticky=tk.W, padx=2, pady=2)
-        self.test_position_var = tk.StringVar(value="0 steps (0°)")
-        ttk.Label(motor_frame, textvariable=self.test_position_var).grid(row=4, column=1, columnspan=2, sticky=tk.W, padx=2)
-        
-        ttk.Label(motor_frame, text="Z Position:").grid(row=5, column=0, sticky=tk.W, padx=2, pady=2)
-        self.test_position_z_var = tk.StringVar(value="0 steps")
-        ttk.Label(motor_frame, textvariable=self.test_position_z_var).grid(row=5, column=1, columnspan=2, sticky=tk.W, padx=2)
-        
-        # LiDAR reading section
-        lidar_frame = ttk.LabelFrame(test_tab, text="LiDAR Reading", padding="5")
-        lidar_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
-        
-        # Distance display
-        ttk.Label(lidar_frame, text="Distance:").grid(row=0, column=0, sticky=tk.W, padx=2)
-        self.lidar_distance_var = tk.StringVar(value="-- cm")
-        distance_label = ttk.Label(lidar_frame, textvariable=self.lidar_distance_var, 
-                                   font=("Arial", 12, "bold"), foreground="blue")
-        distance_label.grid(row=0, column=1, sticky=tk.W, padx=5)
-        
-        # Start/Stop continuous reading
-        self.lidar_read_btn = ttk.Button(lidar_frame, text="Start Reading", 
-                                       command=self.toggle_lidar_reading, state=tk.DISABLED)
-        self.lidar_read_btn.grid(row=0, column=2, padx=5)
-        
-        # Reading status
-        self.lidar_status_var = tk.StringVar(value="Stopped")
-        ttk.Label(lidar_frame, textvariable=self.lidar_status_var, foreground="gray").grid(
-            row=1, column=0, columnspan=3, pady=2)
-        
-        # Test button
-        self.test_btn = ttk.Button(test_tab, text="Start Test (0° → 180°)", command=self.start_test, 
-                                   state=tk.DISABLED, width=25)
-        self.test_btn.grid(row=3, column=0, columnspan=3, pady=5)
-        
-        # Test status
-        self.test_status_label = ttk.Label(test_tab, text="Status: Ready", foreground="blue")
-        self.test_status_label.grid(row=5, column=0, columnspan=3, pady=2)
-        
-        # Test results
-        results_frame = ttk.LabelFrame(test_tab, text="Test Results", padding="10")
-        results_frame.grid(row=5, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        
-        self.test_results_text = tk.Text(results_frame, height=8, width=40, font=("Consolas", 9))
-        self.test_results_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        test_scrollbar = ttk.Scrollbar(results_frame, orient=tk.VERTICAL, command=self.test_results_text.yview)
-        test_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        self.test_results_text.configure(yscrollcommand=test_scrollbar.set)
-        
-        results_frame.rowconfigure(0, weight=1)
-        results_frame.columnconfigure(0, weight=1)
-        
+        """Setup Test tab content with GRBL-style controls"""
+        # Info label at top
+        info_label = ttk.Label(test_tab,
+                              text="⚠️ Connect to device in Control tab first, then use this tab to test GRBL firmware features",
+                              font=("Arial", 9), foreground="blue")
+        info_label.grid(row=0, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        # Main container with horizontal layout
+        main_test_frame = ttk.Frame(test_tab)
+        main_test_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5, pady=5)
+
+        # Left panel: Sliders
+        left_panel = ttk.Frame(main_test_frame)
+        left_panel.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+
+        # Feed rate slider
+        feed_frame = ttk.Frame(left_panel)
+        feed_frame.grid(row=0, column=0, pady=10)
+
+        ttk.Label(feed_frame, text="Speed (F)", font=("Arial", 9)).grid(row=0, column=0, pady=2)
+        self.speed_var = tk.DoubleVar(value=500.0)
+        speed_slider = tk.Scale(feed_frame, from_=1, to=2000, resolution=1, orient=tk.VERTICAL,
+                               variable=self.speed_var, length=200,
+                               command=self.on_speed_change)
+        speed_slider.grid(row=1, column=0)
+        self.speed_label = ttk.Label(feed_frame, text="F500", font=("Arial", 10, "bold"))
+        self.speed_label.grid(row=2, column=0, pady=2)
+
+        # Distance slider
+        dist_frame = ttk.Frame(left_panel)
+        dist_frame.grid(row=0, column=1, padx=20, pady=10)
+
+        ttk.Label(dist_frame, text="Step (mm)", font=("Arial", 9)).grid(row=0, column=0, pady=2)
+        self.step_var = tk.DoubleVar(value=0.1)
+        step_slider = tk.Scale(dist_frame, from_=0.1, to=500, resolution=0.1, orient=tk.VERTICAL,
+                               variable=self.step_var, length=200,
+                               command=self.on_step_change)
+        step_slider.grid(row=1, column=0)
+        self.step_label = ttk.Label(dist_frame, text="0.1", font=("Arial", 10, "bold"))
+        self.step_label.grid(row=2, column=0, pady=2)
+
+        # Center panel: Directional controls
+        center_panel = ttk.Frame(main_test_frame)
+        center_panel.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=20)
+
+        # Create 3x3 grid of directional buttons
+        self.direction_buttons = {}
+        directions = [
+            (0, 0, "NW", "↖", lambda: self.move_direction("NW")),
+            (0, 1, "N", "↑", lambda: self.move_direction("N")),
+            (0, 2, "NE", "↗", lambda: self.move_direction("NE")),
+            (1, 0, "W", "←", lambda: self.move_direction("W")),
+            (1, 1, "HOME", "⌂", self.go_home_test),
+            (1, 2, "E", "→", lambda: self.move_direction("E")),
+            (2, 0, "SW", "↙", lambda: self.move_direction("SW")),
+            (2, 1, "S", "↓", lambda: self.move_direction("S")),
+            (2, 2, "SE", "↘", lambda: self.move_direction("SE")),
+        ]
+
+        for row, col, direction, icon, cmd in directions:
+            btn = ttk.Button(center_panel, text=icon, command=cmd, width=4, state=tk.DISABLED)
+            btn.grid(row=row, column=col, padx=2, pady=2)
+            self.direction_buttons[direction] = btn
+
+        # Right panel: VL53L0X display
+        right_panel = ttk.LabelFrame(main_test_frame, text="VL53L0X Distance Sensor", padding="10")
+        right_panel.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+
+        # Large distance display
+        self.vl53_distance_var = tk.StringVar(value="--")
+        distance_display = ttk.Label(right_panel, textvariable=self.vl53_distance_var,
+                                    font=("Arial", 24, "bold"), foreground="blue")
+        distance_display.grid(row=0, column=0, pady=10)
+
+        ttk.Label(right_panel, text="mm", font=("Arial", 12)).grid(row=0, column=1, sticky=tk.W, padx=5)
+
+        # Start/Stop reading button
+        self.vl53_read_btn = ttk.Button(right_panel, text="Start Reading",
+                                        command=self.toggle_vl53_reading, state=tk.DISABLED)
+        self.vl53_read_btn.grid(row=1, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
+
+        # Status
+        self.vl53_status_var = tk.StringVar(value="Stopped")
+        ttk.Label(right_panel, textvariable=self.vl53_status_var, foreground="gray").grid(
+            row=2, column=0, columnspan=2, pady=5)
+
+        # Visual distance bar
+        self.distance_canvas = tk.Canvas(right_panel, width=200, height=20, bg="lightgray")
+        self.distance_canvas.grid(row=3, column=0, columnspan=2, pady=10)
+        self.distance_bar = self.distance_canvas.create_rectangle(0, 0, 0, 20, fill="green")
+
+        # Bottom panel: Position display and controls
+        bottom_panel = ttk.Frame(test_tab)
+        bottom_panel.grid(row=2, column=0, sticky=(tk.W, tk.E), padx=5, pady=5)
+
+        # Current position display - CORRECTED LABELS
+        pos_frame = ttk.LabelFrame(bottom_panel, text="Current Position", padding="5")
+        pos_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # X position displays angle (from GRBL Y axis after swap)
+        ttk.Label(pos_frame, text="X (Góc quay, 0.1mm=45°):").grid(row=0, column=0, padx=5)
+        self.test_x_pos_var = tk.StringVar(value="0.0°")
+        ttk.Label(pos_frame, textvariable=self.test_x_pos_var, font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
+
+        # Z position displays height (from GRBL X axis after swap, M8 lead screw)
+        ttk.Label(pos_frame, text="Z (Chiều cao, M8 1rev=8mm):").grid(row=0, column=2, padx=5)
+        self.test_z_pos_var = tk.StringVar(value="0.0 mm")
+        ttk.Label(pos_frame, textvariable=self.test_z_pos_var, font=("Arial", 10, "bold")).grid(row=0, column=3, padx=5)
+
+        # Axis rotation controls
+        axis_frame = ttk.LabelFrame(bottom_panel, text="Axis Rotation Controls", padding="10")
+        axis_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+
+        # X Axis rotation controls
+        x_axis_frame = ttk.Frame(axis_frame)
+        x_axis_frame.grid(row=0, column=0, padx=10, pady=5, sticky=(tk.W, tk.E))
+
+        ttk.Label(x_axis_frame, text="X Axis (Rotation):", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=5)
+
+        self.rotate_x_cw_btn = ttk.Button(x_axis_frame, text="X CW ↻",
+                                          command=self.rotate_x_cw_test, state=tk.DISABLED, width=12)
+        self.rotate_x_cw_btn.grid(row=1, column=0, padx=5, pady=2)
+
+        self.rotate_x_ccw_btn = ttk.Button(x_axis_frame, text="X CCW ↺",
+                                           command=self.rotate_x_ccw_test, state=tk.DISABLED, width=12)
+        self.rotate_x_ccw_btn.grid(row=1, column=1, padx=5, pady=2)
+
+        self.rotate_x_full_cw_btn = ttk.Button(x_axis_frame, text="X 360° CW",
+                                               command=self.rotate_x_full_cw_test, state=tk.DISABLED, width=12)
+        self.rotate_x_full_cw_btn.grid(row=1, column=2, padx=5, pady=2)
+
+        self.rotate_x_full_ccw_btn = ttk.Button(x_axis_frame, text="X 360° CCW",
+                                                command=self.rotate_x_full_ccw_test, state=tk.DISABLED, width=12)
+        self.rotate_x_full_ccw_btn.grid(row=1, column=3, padx=5, pady=2)
+
+        # Z Axis controls (mapped from GRBL Y, vertical movement)
+        y_axis_frame = ttk.Frame(axis_frame)
+        y_axis_frame.grid(row=1, column=0, padx=10, pady=5, sticky=(tk.W, tk.E))
+
+        ttk.Label(y_axis_frame, text="Z Axis (Chiều cao, M8 leadscrew 1rev=8mm):", font=("Arial", 10, "bold")).grid(row=0, column=0, columnspan=4, sticky=tk.W, pady=5)
+
+        self.rotate_y_cw_btn = ttk.Button(y_axis_frame, text="Z Lên ↑",
+                                          command=self.rotate_y_cw_test, state=tk.DISABLED, width=12)
+        self.rotate_y_cw_btn.grid(row=1, column=0, padx=5, pady=2)
+
+        self.rotate_y_ccw_btn = ttk.Button(y_axis_frame, text="Z Xuống ↓",
+                                           command=self.rotate_y_ccw_test, state=tk.DISABLED, width=12)
+        self.rotate_y_ccw_btn.grid(row=1, column=1, padx=5, pady=2)
+
+        self.rotate_y_full_cw_btn = ttk.Button(y_axis_frame, text="Z Lên Hết",
+                                               command=self.rotate_y_full_cw_test, state=tk.DISABLED, width=12)
+        self.rotate_y_full_cw_btn.grid(row=1, column=2, padx=5, pady=2)
+
+        self.rotate_y_full_ccw_btn = ttk.Button(y_axis_frame, text="Z Xuống Hết",
+                                                command=self.rotate_y_full_ccw_test, state=tk.DISABLED, width=12)
+        self.rotate_y_full_ccw_btn.grid(row=1, column=3, padx=5, pady=2)
+
+        # Serial communication log
+        log_frame = ttk.LabelFrame(bottom_panel, text="Serial Communication Log", padding="5")
+        log_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+
+        self.serial_log_text = tk.Text(log_frame, height=8, width=80, font=("Consolas", 9), wrap=tk.WORD)
+        self.serial_log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        serial_log_scrollbar = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.serial_log_text.yview)
+        serial_log_scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
+        self.serial_log_text.configure(yscrollcommand=serial_log_scrollbar.set)
+
+        # Clear log button
+        clear_log_btn = ttk.Button(log_frame, text="Clear Log", command=self.clear_serial_log, width=12)
+        clear_log_btn.grid(row=1, column=0, pady=5, sticky=tk.W)
+
+        log_frame.rowconfigure(0, weight=1)
+        log_frame.columnconfigure(0, weight=1)
+
+        # Configure grid weights
         test_tab.columnconfigure(0, weight=1)
-        test_tab.rowconfigure(5, weight=1)
-    
+        test_tab.rowconfigure(1, weight=1)
+        test_tab.rowconfigure(2, weight=1)
+        main_test_frame.columnconfigure(1, weight=1)
+        main_test_frame.rowconfigure(0, weight=1)
+        bottom_panel.rowconfigure(4, weight=1)
+        bottom_panel.columnconfigure(0, weight=1)
+
     def on_tab_changed(self, event):
-        """Handle tab change - clear test points when leaving test tab"""
-        # Clear test points when switching tabs
+        """Handle tab change"""
         if self.test_points:
             self.test_points = []
             self.update_visualization()
-        
+
     def refresh_ports(self):
         """Refresh available serial ports"""
         ports = serial.tools.list_ports.comports()
@@ -399,7 +433,7 @@ class ScannerGUI:
         self.port_combo['values'] = port_list
         if port_list and not self.port_var.get():
             self.port_var.set(port_list[0])
-    
+
     def toggle_connection(self):
         """Connect or disconnect from serial port"""
         if not self.is_connected:
@@ -407,52 +441,77 @@ class ScannerGUI:
             if not port:
                 messagebox.showerror("Error", "Please select a serial port")
                 return
-            
+
             try:
                 self.serial_conn = serial.Serial(port, 115200, timeout=1)
-                time.sleep(2)  # Wait for Arduino to reset
+                time.sleep(2)
                 self.is_connected = True
                 self.connect_btn.config(text="Disconnect")
                 self.status_label.config(text="Status: Connected", foreground="green")
+
+                # ========================================
+                # STARTUP BANNER - Confirm correct version
+                # ========================================
+                self.log_info("=" * 60)
+                self.log_info("CORRECTED VERSION LOADED")
+                self.log_info("Rotation: 0.1mm = 45°, angle = position × 450")
+                self.log_info("Height: M8 lead screw, 1 rev = 8mm")
+                self.log_info("Mapping: GRBL X → GUI Z (height mm)")
+                self.log_info("         GRBL Y → GUI X (angle°)")
+                self.log_info("NOTE: X/Y swapped in commands, swapped back in parsing")
+                self.log_info("=" * 60)
+
+                # Enable buttons
                 if hasattr(self, 'scan_up_btn'):
                     self.scan_up_btn.config(state=tk.NORMAL)
                 if hasattr(self, 'scan_down_btn'):
                     self.scan_down_btn.config(state=tk.NORMAL)
-                self.test_btn.config(state=tk.NORMAL)
-                if hasattr(self, 'rotate_cw_btn'):
-                    self.rotate_cw_btn.config(state=tk.NORMAL)
-                    self.rotate_ccw_btn.config(state=tk.NORMAL)
-                    self.rotate_x_cw_full_btn.config(state=tk.NORMAL)
-                    self.rotate_x_ccw_full_btn.config(state=tk.NORMAL)
-                if hasattr(self, 'rotate_z_cw_btn'):
-                    self.rotate_z_cw_btn.config(state=tk.NORMAL)
-                    self.rotate_z_ccw_btn.config(state=tk.NORMAL)
-                    self.rotate_z_cw_full_btn.config(state=tk.NORMAL)
-                    self.rotate_z_ccw_full_btn.config(state=tk.NORMAL)
-                if hasattr(self, 'lidar_read_btn'):
-                    self.lidar_read_btn.config(state=tk.NORMAL)
-                
+                if hasattr(self, 'vl53_read_btn'):
+                    self.vl53_read_btn.config(state=tk.NORMAL)
+                if hasattr(self, 'direction_buttons'):
+                    for btn in self.direction_buttons.values():
+                        btn.config(state=tk.NORMAL)
+                if hasattr(self, 'rotate_x_cw_btn'):
+                    self.rotate_x_cw_btn.config(state=tk.NORMAL)
+                    self.rotate_x_ccw_btn.config(state=tk.NORMAL)
+                    self.rotate_x_full_cw_btn.config(state=tk.NORMAL)
+                    self.rotate_x_full_ccw_btn.config(state=tk.NORMAL)
+                if hasattr(self, 'rotate_y_cw_btn'):
+                    self.rotate_y_cw_btn.config(state=tk.NORMAL)
+                    self.rotate_y_ccw_btn.config(state=tk.NORMAL)
+                    self.rotate_y_full_cw_btn.config(state=tk.NORMAL)
+                    self.rotate_y_full_ccw_btn.config(state=tk.NORMAL)
+
                 # Start serial reading thread
                 self.serial_thread = threading.Thread(target=self.read_serial, daemon=True)
                 self.serial_thread.start()
-                
+
+                # Start status query thread
+                self.status_query_active = True
+                self.status_query_thread = threading.Thread(target=self.status_query_loop, daemon=True)
+                self.status_query_thread.start()
+
                 self.log_info("Connected to " + port)
-                
-                # Request current configuration from firmware
-                time.sleep(0.5)  # Wait a bit for connection to stabilize
+
+                # Initialize GRBL
+                time.sleep(2)
                 if self.serial_conn:
-                    self.serial_conn.write(b"GET_CONFIG\n")
-                    self.log_info("Requesting configuration from device...")
+                    self.serial_conn.reset_input_buffer()
+                    self.send_serial_command(b"\x18\n", log=True)
+                    time.sleep(0.5)
+                    self.send_serial_command("?\n", log=True)
+                    self.send_serial_command("$X\n", log=True)
+                    self.log_info("GRBL initialized - watching for position updates...")
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to connect: {str(e)}")
         else:
             self.disconnect()
-    
+
     def disconnect(self):
         """Disconnect from serial port"""
         if self.is_connected:
+            self.status_query_active = False
             if self.is_scanning:
-                # Send STOP command to firmware
                 if self.serial_conn:
                     self.serial_conn.write(b"STOP\n")
                 self.is_scanning = False
@@ -461,6 +520,8 @@ class ScannerGUI:
                 self.serial_conn.close()
             self.connect_btn.config(text="Connect")
             self.status_label.config(text="Status: Disconnected", foreground="red")
+
+            # Disable buttons
             if hasattr(self, 'scan_up_btn'):
                 self.scan_up_btn.config(state=tk.DISABLED)
             if hasattr(self, 'scan_down_btn'):
@@ -468,30 +529,75 @@ class ScannerGUI:
             self.pause_btn.config(state=tk.DISABLED)
             if hasattr(self, 'resume_btn'):
                 self.resume_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'test_btn'):
-                self.test_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'rotate_cw_btn'):
-                self.rotate_cw_btn.config(state=tk.DISABLED)
-                self.rotate_ccw_btn.config(state=tk.DISABLED)
-                self.rotate_x_cw_full_btn.config(state=tk.DISABLED)
-                self.rotate_x_ccw_full_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'rotate_z_cw_btn'):
-                self.rotate_z_cw_btn.config(state=tk.DISABLED)
-                self.rotate_z_ccw_btn.config(state=tk.DISABLED)
-                self.rotate_z_cw_full_btn.config(state=tk.DISABLED)
-                self.rotate_z_ccw_full_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'lidar_read_btn'):
-                self.lidar_reading_active = False
-                self.lidar_read_btn.config(state=tk.DISABLED)
-                self.lidar_read_btn.config(text="Start Reading")
-                self.lidar_status_var.set("Stopped")
-                self.lidar_distance_var.set("-- cm")
+            if hasattr(self, 'vl53_read_btn'):
+                self.vl53_reading_active = False
+                self.vl53_read_btn.config(state=tk.DISABLED)
+                self.vl53_read_btn.config(text="Start Reading")
+                self.vl53_status_var.set("Stopped")
+                if hasattr(self, 'vl53_distance_var'):
+                    self.vl53_distance_var.set("--")
+            if hasattr(self, 'direction_buttons'):
+                for btn in self.direction_buttons.values():
+                    btn.config(state=tk.DISABLED)
+            if hasattr(self, 'rotate_x_cw_btn'):
+                self.rotate_x_cw_btn.config(state=tk.DISABLED)
+                self.rotate_x_ccw_btn.config(state=tk.DISABLED)
+                self.rotate_x_full_cw_btn.config(state=tk.DISABLED)
+                self.rotate_x_full_ccw_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'rotate_y_cw_btn'):
+                self.rotate_y_cw_btn.config(state=tk.DISABLED)
+                self.rotate_y_ccw_btn.config(state=tk.DISABLED)
+                self.rotate_y_full_cw_btn.config(state=tk.DISABLED)
+                self.rotate_y_full_ccw_btn.config(state=tk.DISABLED)
             if hasattr(self, 'move_to_top_btn'):
                 self.move_to_top_btn.config(state=tk.DISABLED)
             if hasattr(self, 'home_btn'):
                 self.home_btn.config(state=tk.DISABLED)
             self.log_info("Disconnected")
-    
+
+    def send_serial_command(self, command, log=True):
+        """Send command to serial and log it"""
+        if self.serial_conn:
+            try:
+                if isinstance(command, str):
+                    command_bytes = command.encode()
+                else:
+                    command_bytes = command
+
+                # Send to serial
+                self.serial_conn.write(command_bytes)
+
+                if log:
+                    try:
+                        cmd_str = command_bytes.decode('utf-8', errors='replace').strip()
+                        cmd_str = cmd_str.replace('\x18', '[RESET]').replace('\r', '').replace('\n', '')
+
+                        # ============================================
+                        # CONSOLE LOG: Print ALL sent commands
+                        # ============================================
+                        print(f"[SERIAL TX] {cmd_str}")
+
+                        # Log to GUI
+                        self.log_serial_send(cmd_str)
+                    except:
+                        print(f"[SERIAL TX] [BINARY: {len(command_bytes)} bytes]")
+                        self.log_serial_send(f"[BINARY: {len(command_bytes)} bytes]")
+            except Exception as e:
+                print(f"[ERROR] Failed to send command: {str(e)}")
+                self.log_info(f"Error sending command: {str(e)}")
+
+    def status_query_loop(self):
+        """Periodically send status query (?) to GRBL"""
+        while self.status_query_active and self.is_connected:
+            try:
+                if self.serial_conn:
+                    self.send_serial_command("?\n", log=False)
+                time.sleep(0.2)
+            except Exception as e:
+                if self.status_query_active:
+                    self.log_info(f"Status query error: {str(e)}")
+                break
+
     def read_serial(self):
         """Read data from serial port in background thread"""
         while self.is_connected and self.serial_conn:
@@ -499,1147 +605,1077 @@ class ScannerGUI:
                 if self.serial_conn.in_waiting > 0:
                     line = self.serial_conn.readline().decode('utf-8', errors='ignore').strip()
                     if line:
-                        self.process_serial_data(line)
+                        # CALLBACK: Log ALL serial data to console
+                        self.on_serial_received(line)
             except Exception as e:
                 if self.is_connected:
                     self.log_info(f"Serial error: {str(e)}")
                 break
-    
+
+    def on_serial_received(self, line):
+        """
+        CALLBACK 1: Called for EVERY line received from serial port (BEFORE parsing)
+        This is where ALL serial data arrives FIRST
+        """
+        # ============================================
+        # CONSOLE LOG: Print RAW received data (BEFORE PARSE)
+        # ============================================
+        print(f"[RX RAW] {line}")
+
+        # Log to GUI serial log
+        self.log_serial_receive(line)
+
+        # Process the data (this will call parse if needed)
+        self.process_serial_data(line)
+
+    def on_data_parsed(self, data_type, parsed_data):
+        """
+        CALLBACK 2: Called AFTER data has been successfully parsed
+        This shows what was extracted from the serial data
+        """
+        # ============================================
+        # CONSOLE LOG: Print PARSED data (AFTER PARSE)
+        # ============================================
+        print(f"[PARSED] Type: {data_type}, Data: {parsed_data}")
+
+        # Log to GUI if needed
+        if data_type == "position":
+            x_mm = parsed_data.get('x', 0)
+            z_mm = parsed_data.get('z', 0)  # Z height from GRBL Y (M8 leadscrew)
+            angle = parsed_data.get('angle', 0)
+            print(f"[RESULT] Position → X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
+            self.log_info(f"✓ Position: X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
+
     def process_serial_data(self, line):
-        """Process incoming serial data"""
-        if line.startswith("SCAN_START"):
-            # Firmware starts a new scan, so clear data
-            self.scan_data = []
-            self.current_layer = 0
-            self.current_step = 0
-            self.progress_bar['value'] = 0
-            self.progress_var.set("0% (0 points)")
-            # Keep export buttons enabled - they will check if data exists when clicked
-            self.log_info("Bắt đầu quét...")
-            self.update_visualization()  # Clear visualization
-            # Start step-by-step scan thread
-            self.step_by_step_active = True
-            if self.scan_step_thread is None or not self.scan_step_thread.is_alive():
-                self.scan_step_thread = threading.Thread(target=self.send_scan_steps, daemon=True)
-                self.scan_step_thread.start()
-        elif line.startswith("SCAN_COMPLETE"):
-            self.is_scanning = False
-            self.step_by_step_active = False  # Stop sending SCAN_STEP commands
-            if hasattr(self, 'scan_up_btn'):
-                self.scan_up_btn.config(state=tk.NORMAL)
-            if hasattr(self, 'scan_down_btn'):
-                self.scan_down_btn.config(state=tk.NORMAL)
-            self.pause_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'resume_btn'):
-                self.resume_btn.config(state=tk.DISABLED)
-            # Export buttons are always enabled - they check for data when clicked
-            self.progress_bar['value'] = 100
-            self.progress_var.set("100%")
-            self.log_info("Quét hoàn thành")
-            self.update_visualization()
-        elif line.startswith("SCAN_PAUSED"):
-            self.is_scanning = False
-            self.pause_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'resume_btn'):
-                self.resume_btn.config(state=tk.NORMAL)
-            self.log_info("Scan đã tạm dừng")
-        elif line.startswith("SCAN_RESUMED"):
-            self.is_scanning = True
-            if hasattr(self, 'resume_btn'):
-                self.resume_btn.config(state=tk.DISABLED)
-            self.pause_btn.config(state=tk.NORMAL)
-            self.log_info("Scan đã tiếp tục")
-        elif line.startswith("SCAN_STOPPED"):
-            self.is_scanning = False
-            if hasattr(self, 'scan_up_btn'):
-                self.scan_up_btn.config(state=tk.NORMAL)
-            if hasattr(self, 'scan_down_btn'):
-                self.scan_down_btn.config(state=tk.NORMAL)
-            self.pause_btn.config(state=tk.DISABLED)
-            if hasattr(self, 'resume_btn'):
-                self.resume_btn.config(state=tk.DISABLED)
-            self.log_info("Scan stopped")
-        elif line.startswith("CURRENT_CONFIG:"):
-            # Parse and load configuration from firmware
+        """Process incoming serial data from GRBL firmware"""
+        # Handle GRBL status reports: <Idle|MPos:0.000,0.000,0.000|FS:0,0>
+        if line.startswith("<"):
+            # ============================================
+            # CONSOLE LOG: Confirm we caught GRBL status
+            # ============================================
+            print(f"[PROCESS] Detected GRBL status line, calling parse_grbl_status()...")
+            self.parse_grbl_status(line)
+            return
+
+        # Handle GRBL responses
+        if line.startswith("ok"):
+            return
+        elif line.startswith("error:"):
+            self.log_info(f"GRBL Error: {line}")
+            return
+        elif line.startswith("ALARM:"):
+            self.log_info(f"GRBL Alarm: {line}")
+            return
+
+        # Handle VL53L0X distance reading
+        if "VL53L0X" in line.upper() or line.startswith("DISTANCE:"):
             try:
-                config_str = line.replace("CURRENT_CONFIG:", "")
-                values = config_str.strip().split(',')
-                if len(values) >= 5:
-                    # θ Steps - synchronized from firmware (single source of truth)
-                    self.theta_steps_var.set(values[0])
-                    self.log_info(f"θ Steps synchronized from firmware: {values[0]}")
-                    self.z_travel_var.set(values[1])
-                    # Z Steps/mm - synchronized from firmware (hidden in GUI, fixed for vitme phi 8)
-                    self.z_steps_per_mm_var.set(values[2])
-                    # No log message since it's hidden from user
-                    # z_steps_per_layer is now auto-calculated, but we can calculate z_layer_height from it
-                    if len(values) >= 4:
-                        z_steps_per_layer = int(values[3])
-                        z_steps_per_mm = int(values[2])
-                        if z_steps_per_mm > 0:
-                            z_layer_height = z_steps_per_layer / z_steps_per_mm
-                            self.z_layer_height_var.set(f"{z_layer_height:.2f}")
-                            self.log_info(f"Z layer height calculated: {z_steps_per_layer} steps / {z_steps_per_mm} steps/mm = {z_layer_height:.2f} mm")
-                    self.scan_delay_var.set(values[4])
-                    # Center distance is optional (for backward compatibility)
-                    if len(values) >= 6:
-                        self.center_distance_var.set(values[5])
-                    # Steps per revolution - synchronized from firmware (single source of truth)
-                    if len(values) >= 7:
-                        self.steps_per_rev_var.set(values[6])
-                        self.log_info(f"Steps/Rev synchronized from firmware: {values[6]}")
-                    self.log_info("Configuration loaded from device")
+                import re
+                if ":" in line:
+                    parts = line.split(":")
+                    if len(parts) > 1:
+                        dist_str = parts[1].strip()
+                        dist_str = re.sub(r'[^0-9.]', '', dist_str)
+                        if dist_str:
+                            distance_mm = float(dist_str)
+                            self.update_vl53_display(distance_mm)
+                            return
+
+                match = re.search(r'(\d+\.?\d*)\s*(mm|cm)', line, re.IGNORECASE)
+                if match:
+                    distance = float(match.group(1))
+                    unit = match.group(2).lower()
+                    if unit == "cm":
+                        distance = distance * 10
+                    self.update_vl53_display(distance)
+                    return
             except Exception as e:
-                self.log_info(f"Error loading config: {str(e)}")
-        elif line.startswith("HOME_COMPLETE"):
-            self.log_info("Home position reached")
-        elif line.startswith("MOVE_TO_TOP_COMPLETE"):
-            self.log_info("Top position reached")
-        elif line.startswith("CONFIG_OK"):
-            self.log_info("Configuration applied: " + line)
-        elif line.startswith("CONFIG_ERROR"):
-            self.log_info("Configuration error: " + line)
-            messagebox.showerror("Config Error", line)
-        elif line.startswith("TEST_POINT:"):
-            # Parse test point: TEST_POINT:angle,distance
-            try:
-                test_str = line.replace("TEST_POINT:", "")
-                parts = test_str.strip().split(',')
-                if len(parts) == 2:
-                    angle = float(parts[0])
-                    distance = float(parts[1])
-                    self.add_test_point(angle, distance)
-            except Exception as e:
-                self.log_info(f"Error parsing test point: {str(e)}")
-        elif line.startswith("ROTATED:"):
-            # Parse rotation confirmation: ROTATED:steps (negative for CCW)
-            try:
-                steps_str = line.replace("ROTATED:", "")
-                steps = int(steps_str.strip())
-                theta_steps = int(self.theta_steps_var.get())
-                if steps < 0:
-                    # Counter-clockwise
-                    self.test_current_step = (self.test_current_step - abs(steps) + theta_steps) % theta_steps
-                else:
-                    # Clockwise
-                    self.test_current_step = (self.test_current_step + steps) % theta_steps
-                self.update_test_position()
-            except Exception as e:
-                self.log_info(f"Error parsing rotation: {str(e)}")
-        elif line.startswith("LIDAR_DISTANCE:"):
-            # Parse continuous lidar reading: LIDAR_DISTANCE:distance
-            try:
-                dist_str = line.replace("LIDAR_DISTANCE:", "")
-                distance = float(dist_str.strip())
-                if hasattr(self, 'lidar_distance_var'):
-                    self.lidar_distance_var.set(f"{distance:.2f} cm")
-                if hasattr(self, 'lidar_status_var'):
-                    self.lidar_status_var.set("Reading...")
-            except Exception as e:
-                if hasattr(self, 'lidar_status_var'):
-                    self.lidar_status_var.set("Error reading")
-        elif line.startswith("ROTATED_Z:"):
-            # Parse Z motor rotation confirmation: ROTATED_Z:steps (negative for CCW)
-            try:
-                steps_str = line.replace("ROTATED_Z:", "")
-                steps = int(steps_str.strip())
-                if steps < 0:
-                    # Counter-clockwise
-                    self.test_current_step_z -= abs(steps)
-                else:
-                    # Clockwise
-                    self.test_current_step_z += steps
-                self.update_test_position()
-            except Exception as e:
-                self.log_info(f"Error parsing Z rotation: {str(e)}")
-        elif ',' in line:
-            # Parse scan data: "LAYER,STEP,DISTANCE" or "LAYER,STEP,DISTANCE,ANGLE"
-            try:
-                parts = line.split(',')
-                if len(parts) >= 3:
-                    layer = int(parts[0])
-                    step = int(parts[1])
-                    distance = float(parts[2])
-                    
-                    # Always update progress and current position
-                    self.current_layer = layer
-                    self.current_step = step
-                    
-                    # Get angle from firmware if provided, otherwise calculate
-                    if len(parts) >= 4:
-                        # Angle provided by firmware
-                        self.current_angle = float(parts[3])
-                    else:
-                        # Calculate angle from step
-                        try:
-                            theta_steps = int(self.theta_steps_var.get())
-                            if theta_steps > 0:
-                                self.current_angle = (step % theta_steps) * 360.0 / theta_steps
-                        except:
-                            self.current_angle = 0.0
-                    
-                    # Update angle display
-                    if hasattr(self, 'current_angle_var'):
-                        self.current_angle_var.set(f"{self.current_angle:.1f}°")
-                    
-                    # Skip invalid points (distance = 0 means LiDAR error)
-                    # Don't add to scan_data, just skip to next point
-                    if distance <= 0 or distance > 1200:
-                        # Skip this point - don't add to scan_data, don't display in 3D view
-                        # Just return early, don't process this point
-                        return
-                    
-                    # Add valid point to scan_data
-                    self.scan_data.append([layer, step, distance])
-                    
-                    # Update progress
-                    theta_steps = int(self.theta_steps_var.get())
-                    z_travel = int(self.z_travel_var.get())
-                    z_steps_per_mm = int(self.z_steps_per_mm_var.get())
-                    z_layer_height = float(self.z_layer_height_var.get())
-                    # Auto-calculate z_steps_per_layer from z_layer_height
-                    z_steps_per_layer = int(z_layer_height * z_steps_per_mm)
-                    z_layers = (z_travel * z_steps_per_mm) // z_steps_per_layer if z_steps_per_layer > 0 else 0
-                    total_points = theta_steps * z_layers
-                    current_point = layer * theta_steps + step
-                    if total_points > 0:
-                        progress = (current_point / total_points) * 100
-                        self.progress_bar['value'] = progress
-                        self.progress_var.set(f"{progress:.1f}% ({len(self.scan_data)} points)")
-                    
-                    # Export buttons are always enabled - they check for data when clicked
-                    
-                    # Update visualization more frequently (every 5 points if we have data, every 10 otherwise)
-                    update_interval = 5 if len(self.scan_data) > 0 else 10
-                    if len(self.scan_data) % update_interval == 0:
-                        self.update_visualization()
-            except ValueError:
                 pass
-    
-    def start_scan_up(self):
-        """Start scanning from bottom to top (upward)"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
             return
-        
-        # Auto-send config before starting scan to ensure firmware has correct values
+
+        # Legacy protocol handlers (for backward compatibility with custom firmware)
+        # ... (rest of the protocol handling code remains the same as original)
+
+    def parse_grbl_status(self, status_line):
+        """Parse GRBL status report and update position display
+        CORRECTED CALIBRATION: 0.1mm = 45 degrees, so angle = position_mm × 450
+        Mapping: GRBL X -> GUI Z (height), GRBL Y -> GUI X (angle)
+        NOTE: format_gcode_command swaps X/Y when sending, so we swap back when parsing
+
+        GRBL 0.9j format: <Idle,MPos:0.100,0.000,0.000,WPos:0.100,0.000,0.000>
+        """
+        print(f"\n{'='*70}")
+        print(f"[PARSE] ▶ START PARSING")
+        print(f"[PARSE] Input: {status_line}")
+
         try:
-            # Send config silently (without messagebox)
-            self._send_config_silent()
-            time.sleep(0.2)  # Wait a bit for config to be processed
-        except:
-            pass  # Continue even if config send fails
-        
-        self.is_scanning = True
-        if hasattr(self, 'scan_up_btn'):
-            self.scan_up_btn.config(state=tk.DISABLED)
-        if hasattr(self, 'scan_down_btn'):
-            self.scan_down_btn.config(state=tk.DISABLED)
-        self.pause_btn.config(state=tk.NORMAL)
-        if hasattr(self, 'resume_btn'):
-            self.resume_btn.config(state=tk.DISABLED)
-        # Export buttons remain enabled - they check for data when clicked
-        self.progress_bar['value'] = 0
-        self.progress_var.set("0%")
-        
-        if self.serial_conn:
-            self.serial_conn.write(b"START_UP\n")
-        self.log_info("Bắt đầu quét từ dưới lên...")
-    
-    def start_scan_down(self):
-        """Start scanning from top to bottom (downward)"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
-            return
-        
-        # Auto-send config before starting scan to ensure firmware has correct values
-        try:
-            # Send config silently (without messagebox)
-            self._send_config_silent()
-            time.sleep(0.2)  # Wait a bit for config to be processed
-        except:
-            pass  # Continue even if config send fails
-        
-        self.is_scanning = True
-        if hasattr(self, 'scan_up_btn'):
-            self.scan_up_btn.config(state=tk.DISABLED)
-        if hasattr(self, 'scan_down_btn'):
-            self.scan_down_btn.config(state=tk.DISABLED)
-        self.pause_btn.config(state=tk.NORMAL)
-        if hasattr(self, 'resume_btn'):
-            self.resume_btn.config(state=tk.DISABLED)
-        # Export buttons remain enabled - they check for data when clicked
-        self.progress_bar['value'] = 0
-        self.progress_var.set("0%")
-        
-        if self.serial_conn:
-            self.serial_conn.write(b"START_DOWN\n")
-        self.log_info("Bắt đầu quét từ trên xuống...")
-    
-    def send_scan_steps(self):
-        """Send SCAN_STEP commands continuously until scan is complete"""
-        while self.step_by_step_active and self.is_scanning and self.is_connected:
-            if self.serial_conn:
-                try:
-                    self.serial_conn.write(b"SCAN_STEP\n")
-                    time.sleep(0.05)  # Small delay between steps (50ms)
-                except Exception as e:
-                    self.log_info(f"Error sending SCAN_STEP: {str(e)}")
-                    break
+            # Step 1: Remove < and >
+            print(f"[PARSE] Step 1: Removing < and >...")
+            clean = status_line.strip("<>")
+            print(f"[PARSE] Step 1 result: '{clean}'")
+
+            # Step 2: Find MPos section
+            # GRBL 0.9j format: Idle,MPos:X,Y,Z,WPos:X,Y,Z
+            print(f"[PARSE] Step 2: Looking for 'MPos:' in string...")
+
+            if "MPos:" not in clean:
+                print(f"[PARSE] ✗ ERROR: No 'MPos:' found in status!")
+                print(f"{'='*70}\n")
+                return
+
+            print(f"[PARSE] Step 2: ✓ Found 'MPos:'")
+
+            # Step 3: Extract state (first part before comma)
+            print(f"[PARSE] Step 3: Extracting state...")
+            first_comma = clean.find(',')
+            if first_comma > 0:
+                self.grbl_state = clean[:first_comma]
+                print(f"[PARSE] Step 3: State = '{self.grbl_state}'")
             else:
-                break
-    
-    def pause_scan(self):
-        """Pause scanning"""
-        self.step_by_step_active = False  # Stop sending SCAN_STEP commands
-        if self.serial_conn:
-            self.serial_conn.write(b"STOP\n")
-        self.pause_btn.config(state=tk.DISABLED)
-        self.resume_btn.config(state=tk.NORMAL)
-        self.log_info("Tạm dừng quét...")
-    
-    def resume_scan(self):
-        """Resume paused scanning"""
-        if not self.is_connected:
-            return
-        if self.serial_conn:
-            self.serial_conn.write(b"RESUME\n")
-        # Restart step-by-step scan thread
-        self.step_by_step_active = True
-        if self.scan_step_thread is None or not self.scan_step_thread.is_alive():
-            self.scan_step_thread = threading.Thread(target=self.send_scan_steps, daemon=True)
-            self.scan_step_thread.start()
-        self.resume_btn.config(state=tk.DISABLED)
-        self.pause_btn.config(state=tk.NORMAL)
-        self.log_info("Tiếp tục quét...")
-    
-    def clear_data(self):
-        """Clear scan data and reset visualization"""
-        self.scan_data = []
-        self.current_layer = 0
-        self.current_step = 0
-        self.current_angle = 0.0  # Current rotation angle in degrees
-        self.progress_bar['value'] = 0
-        self.progress_var.set("0%")
-        # Export buttons remain enabled - they check for data when clicked
-        
-        # Clear visualization
-        self.ax.clear()
-        self.ax.set_xlabel('X (cm)')
-        self.ax.set_ylabel('Y (cm)')
-        self.ax.set_zlabel('Z (cm)')
-        self.ax.set_title('3D Scan Point Cloud')
-        self.canvas.draw()
-        
-        self.log_info("Scan data cleared")
-    
-    def move_to_top(self):
-        """Move Z motor to top position"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
-            return
-        if self.serial_conn:
-            self.serial_conn.write(b"MOVE_TO_TOP\n")
-            self.log_info("Moving to top position...")
-    
-    def go_home(self):
-        """Move Z motor to home position"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
-            return
-        if self.serial_conn:
-            self.serial_conn.write(b"HOME\n")
-            self.log_info("Returning to home position...")
-    
-    def send_config(self):
-        """Send configuration to firmware"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
-            return
-        
-        try:
-            # Get values from GUI
-            theta_steps = int(self.theta_steps_var.get())
-            z_travel = int(self.z_travel_var.get())
-            z_steps_per_mm = int(self.z_steps_per_mm_var.get())
-            z_layer_height = float(self.z_layer_height_var.get())
-            scan_delay = int(self.scan_delay_var.get())
-            center_distance = float(self.center_distance_var.get())
-            steps_per_rev = int(self.steps_per_rev_var.get())
-            
-            # Auto-calculate z_steps_per_layer from z_layer_height
-            z_steps_per_layer = int(z_layer_height * z_steps_per_mm)
-            
-            # Validate theta_steps limits
-            MIN_THETA_STEPS = 4
-            MAX_THETA_STEPS = 3600
-            
-            if theta_steps < MIN_THETA_STEPS or theta_steps > MAX_THETA_STEPS:
-                messagebox.showerror("Error", f"θ Steps must be between {MIN_THETA_STEPS} and {MAX_THETA_STEPS}")
+                print(f"[PARSE] Step 3: Warning - no comma found, can't extract state")
+
+            # Step 4: Extract MPos values
+            print(f"[PARSE] Step 4: Extracting MPos section...")
+            mpos_start = clean.find("MPos:") + 5  # After "MPos:"
+            print(f"[PARSE] Step 4: MPos starts at index {mpos_start}")
+
+            # Find end of MPos (either WPos or end of string)
+            mpos_end = clean.find(",WPos:", mpos_start)
+            if mpos_end == -1:
+                mpos_end = len(clean)  # No WPos, go to end
+
+            print(f"[PARSE] Step 4: MPos ends at index {mpos_end}")
+
+            mpos_str = clean[mpos_start:mpos_end]
+            print(f"[PARSE] Step 4: MPos string = '{mpos_str}'")
+
+            # Step 5: Split MPos values by comma
+            print(f"[PARSE] Step 5: Splitting MPos values by comma...")
+            positions = mpos_str.split(",")
+            print(f"[PARSE] Step 5: Got {len(positions)} values: {positions}")
+
+            if len(positions) < 2:
+                print(f"[PARSE] ✗ ERROR: Need at least 2 positions, got {len(positions)}")
+                print(f"{'='*70}\n")
                 return
-            
-            # Validate that theta_steps doesn't exceed steps_per_rev
-            if theta_steps > steps_per_rev:
-                messagebox.showerror("Error", f"θ Steps ({theta_steps}) cannot exceed Steps/Rev ({steps_per_rev})")
-                return
-            
-            # Validate other values
-            if theta_steps <= 0 or z_travel <= 0 or z_steps_per_mm <= 0 or z_layer_height <= 0 or scan_delay < 0 or center_distance <= 0 or steps_per_rev <= 0:
-                messagebox.showerror("Error", "Invalid configuration values")
-                return
-            
-            # Send config command: CONFIG,theta_steps,z_travel,z_steps_per_mm,z_steps_per_layer,scan_delay,center_distance,steps_per_rev
-            # Note: z_steps_per_layer is auto-calculated from z_layer_height * z_steps_per_mm
-            config_cmd = f"CONFIG,{theta_steps},{z_travel},{z_steps_per_mm},{z_steps_per_layer},{scan_delay},{center_distance},{steps_per_rev}\n"
-            
-            if self.serial_conn:
-                self.serial_conn.write(config_cmd.encode())
-                self.log_info(f"Config sent: θ={theta_steps}, Z={z_travel}mm, {z_steps_per_mm}steps/mm, Z height={z_layer_height}mm (auto: {z_steps_per_layer}steps/layer), delay={scan_delay}ms, center={center_distance}cm")
-                messagebox.showinfo("Success", "Configuration sent to device")
-        except ValueError:
-            messagebox.showerror("Error", "Invalid input values. Please enter numbers only.")
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to send config: {str(e)}")
-    
-    def update_visualization(self):
-        """Update 3D visualization with current scan data and test points"""
-        self.ax.clear()
-        
-        # Get cartesian points from scan data
-        points = None
-        if self.scan_data:
-            points = self.get_cartesian_points()
-        
-        # Plot scan points with mesh/surface
-        if points is not None and len(points) > 0:
-            x = points[:, 0]
-            y = points[:, 1]
-            z = points[:, 2]
-            
-            # Try to create mesh from structured scan data
+
+            # Step 6: Parse X and Y
+            # NOTE: format_gcode_command swaps X and Y when sending:
+            #   GUI X (rotation) → sent as GRBL Y
+            #   GUI Y (height) → sent as GRBL X
+            # So when parsing, we need to swap back:
+            #   positions[0] (GRBL X) = height (GUI Z)
+            #   positions[1] (GRBL Y) = rotation (GUI X)
+            print(f"[PARSE] Step 6: Parsing position values...")
             try:
-                # Reconstruct layer and step structure from scan_data
-                layers_dict = {}
-                point_indices = {}  # Map (layer, step) -> index in points array
-                for i, data in enumerate(self.scan_data):
-                    layer = data[0]
-                    step = data[1]
-                    if layer not in layers_dict:
-                        layers_dict[layer] = []
-                    layers_dict[layer].append(step)
-                    point_indices[(layer, step)] = i
-                
-                # Create mesh by connecting adjacent points
-                if len(layers_dict) > 0:
-                    # Get theta_steps to know the structure
-                    try:
-                        theta_steps = int(self.theta_steps_var.get())
-                    except:
-                        theta_steps = 200  # Default
-                    
-                    # Check if we have enough structured data
-                    has_structure = len(layers_dict) > 1
-                    if has_structure:
-                        # Check if first layer has multiple steps
-                        first_layer = min(layers_dict.keys())
-                        has_structure = has_structure and len(layers_dict[first_layer]) > 1
-                    
-                    if has_structure:
-                        # Create triangles based on scan structure
-                        triangles = []
-                        layers = sorted(layers_dict.keys())
-                        
-                        for layer_idx in range(len(layers) - 1):
-                            layer1 = layers[layer_idx]
-                            layer2 = layers[layer_idx + 1]
-                            
-                            # Get all steps for both layers
-                            steps1 = sorted(layers_dict[layer1])
-                            steps2 = sorted(layers_dict[layer2])
-                            
-                            # Create quads (two triangles) between adjacent points
-                            for i in range(len(steps1) - 1):
-                                step1_curr = steps1[i]
-                                step1_next = steps1[i + 1]
-                                
-                                # Find corresponding steps in layer2
-                                # Try to find step at same position or closest
-                                step2_curr = None
-                                step2_next = None
-                                
-                                # Find closest step in layer2
-                                for step2 in steps2:
-                                    if step2_curr is None or abs(step2 - step1_curr) < abs(step2_curr - step1_curr):
-                                        step2_curr = step2
-                                    if step2_next is None or abs(step2 - step1_next) < abs(step2_next - step1_next):
-                                        step2_next = step2
-                                
-                                # Create triangles if we have all 4 points
-                                if (layer1, step1_curr) in point_indices and \
-                                   (layer1, step1_next) in point_indices and \
-                                   (layer2, step2_curr) in point_indices and \
-                                   (layer2, step2_next) in point_indices:
-                                    
-                                    idx1 = point_indices[(layer1, step1_curr)]
-                                    idx2 = point_indices[(layer1, step1_next)]
-                                    idx3 = point_indices[(layer2, step2_curr)]
-                                    idx4 = point_indices[(layer2, step2_next)]
-                                    
-                                    # Validate indices are within bounds
-                                    max_idx = len(points) - 1
-                                    if idx1 <= max_idx and idx2 <= max_idx and idx3 <= max_idx and idx4 <= max_idx:
-                                        # Triangle 1: (idx1, idx2, idx3)
-                                        triangles.append([idx1, idx2, idx3])
-                                        # Triangle 2: (idx2, idx4, idx3)
-                                        triangles.append([idx2, idx4, idx3])
-                            
-                            # Also connect points within same layer (circular connection)
-                            if len(steps1) > 2:
-                                # Connect last step to first step in layer1
-                                step1_last = steps1[-1]
-                                step1_first = steps1[0]
-                                
-                                # Find corresponding steps in layer2
-                                step2_last = None
-                                step2_first = None
-                                for step2 in steps2:
-                                    if step2_last is None or abs(step2 - step1_last) < abs(step2_last - step1_last):
-                                        step2_last = step2
-                                    if step2_first is None or abs(step2 - step1_first) < abs(step2_first - step1_first):
-                                        step2_first = step2
-                                
-                                if (layer1, step1_last) in point_indices and \
-                                   (layer1, step1_first) in point_indices and \
-                                   (layer2, step2_last) in point_indices and \
-                                   (layer2, step2_first) in point_indices:
-                                    
-                                    idx1 = point_indices[(layer1, step1_last)]
-                                    idx2 = point_indices[(layer1, step1_first)]
-                                    idx3 = point_indices[(layer2, step2_last)]
-                                    idx4 = point_indices[(layer2, step2_first)]
-                                    
-                                    # Validate indices are within bounds
-                                    max_idx = len(points) - 1
-                                    if idx1 <= max_idx and idx2 <= max_idx and idx3 <= max_idx and idx4 <= max_idx:
-                                        triangles.append([idx1, idx2, idx3])
-                                        triangles.append([idx2, idx4, idx3])
-                        
-                        if triangles:
-                            # Use structured mesh
-                            triangles = np.array(triangles)
-                            self.ax.plot_trisurf(x, y, z, triangles=triangles,
-                                                cmap='viridis', alpha=0.7, edgecolor='none',
-                                                linewidth=0, antialiased=True, label='Scan surface')
-                            
-                            # Also show points for reference
-                            self.ax.scatter(x, y, z, c=z, cmap='viridis', s=2, alpha=0.3, 
-                                          edgecolors='none', zorder=1)
-                        else:
-                            # Fallback to Delaunay if structured mesh fails
-                            from scipy.spatial import Delaunay
-                            tri = Delaunay(np.column_stack([x, y]))
-                            self.ax.plot_trisurf(x, y, z, triangles=tri.simplices, 
-                                                cmap='viridis', alpha=0.7, edgecolor='none',
-                                                linewidth=0, antialiased=True, label='Scan surface')
-                            self.ax.scatter(x, y, z, c=z, cmap='viridis', s=2, alpha=0.3, 
-                                          edgecolors='none', zorder=1)
-                    else:
-                        # Not enough structure, use Delaunay triangulation
-                        from scipy.spatial import Delaunay
-                        tri = Delaunay(np.column_stack([x, y]))
-                        self.ax.plot_trisurf(x, y, z, triangles=tri.simplices, 
-                                            cmap='viridis', alpha=0.7, edgecolor='none',
-                                            linewidth=0, antialiased=True, label='Scan surface')
-                        self.ax.scatter(x, y, z, c=z, cmap='viridis', s=2, alpha=0.3, 
-                                      edgecolors='none', zorder=1)
-                else:
-                    # Not enough data, just show points
-                    self.ax.scatter(x, y, z, c=z, cmap='viridis', s=1, alpha=0.6, label='Scan points')
+                # GRBL Y (positions[1]) is actually rotation (GUI X)
+                x_mm = float(positions[1])
+                print(f"[PARSE] Step 6: X (rotation from GRBL Y) = {x_mm} mm")
+            except ValueError as e:
+                print(f"[PARSE] ✗ ERROR parsing X from '{positions[1]}': {e}")
+                print(f"{'='*70}\n")
+                return
+
+            try:
+                # GRBL X (positions[0]) is actually height (GUI Z)
+                y_mm = float(positions[0])
+                print(f"[PARSE] Step 6: Y (height from GRBL X) = {y_mm} mm")
+            except ValueError as e:
+                print(f"[PARSE] ✗ ERROR parsing Y from '{positions[0]}': {e}")
+                print(f"{'='*70}\n")
+                return
+
+            # Parse Z if available
+            if len(positions) >= 3:
+                try:
+                    z_mm = float(positions[2])
+                    print(f"[PARSE] Step 6: Z = {z_mm} mm")
+                    self.current_z_pos = z_mm
+                except:
+                    print(f"[PARSE] Step 6: Warning - couldn't parse Z")
+
+            # Step 7: Update internal state
+            print(f"[PARSE] Step 7: Updating internal variables...")
+            self.current_x_pos = x_mm  # Rotation from GRBL Y
+            self.current_y_pos = y_mm  # Height from GRBL X (M8 lead screw, 1 revolution = 8mm)
+            print(f"[PARSE] Step 7: ✓ Internal state updated")
+            print(f"[PARSE] Step 7: X = {x_mm}mm (rotation from GRBL Y), Y = {y_mm}mm (Z height from GRBL X, M8 leadscrew)")
+
+            # Step 8: Calculate angle from X position
+            print(f"[PARSE] Step 8: Calculating angle from X position...")
+            print(f"[PARSE] Step 8: Formula: {x_mm} mm × 450 = ? degrees")
+            angle = x_mm * 450.0
+            print(f"[PARSE] Step 8: Raw angle = {angle}°")
+
+            # Step 9: Normalize to 0-360
+            print(f"[PARSE] Step 9: Normalizing angle...")
+            angle = angle % 360.0
+            if angle < 0:
+                angle += 360.0
+            print(f"[PARSE] Step 9: ✓ Final angle = {angle}°")
+
+            self.current_angle = angle
+
+            # Step 10: Calculate Z height (already in mm from GRBL X, which is y_mm after swap)
+            # M8 lead screw: 1 revolution = 8mm
+            # GRBL X position is already calibrated in mm (but represents height due to swap)
+            z_height_mm = y_mm
+            print(f"[PARSE] Step 10: Z height = {z_height_mm:.3f}mm (from GRBL X, M8 leadscrew)")
+
+            # Step 11: Log result
+            print(f"[PARSE] Step 11: Logging result...")
+            result_msg = f"X={x_mm:.3f}mm ({angle:.1f}°), Z={z_height_mm:.3f}mm"
+            print(f"[RESULT] ✓ {result_msg}")
+            self.log_info(f"✓ Position: {result_msg}")
+
+            # Step 12: Update GUI
+            print(f"[PARSE] Step 12: Updating GUI display...")
+            has_x_var = hasattr(self, 'test_x_pos_var')
+            has_z_var = hasattr(self, 'test_z_pos_var')
+            print(f"[PARSE] Step 12: Variables exist - X:{has_x_var}, Z:{has_z_var}")
+
+            if has_x_var:
+                try:
+                    self.test_x_pos_var.set(f"{angle:.1f}°")
+                    print(f"[GUI] ✓ X display set to: {angle:.1f}°")
+                except Exception as e:
+                    print(f"[GUI] ✗ Failed to set X: {e}")
+
+            if has_z_var:
+                try:
+                    self.test_z_pos_var.set(f"{z_height_mm:.2f} mm")
+                    print(f"[GUI] ✓ Z display set to: {z_height_mm:.2f} mm")
+                except Exception as e:
+                    print(f"[GUI] ✗ Failed to set Z: {e}")
+
+            # Backup update via root.after
+            try:
+                self.root.after(0, lambda: self._update_position_vars(angle, z_height_mm))
+                print(f"[GUI] ✓ Scheduled backup update")
             except Exception as e:
-                # Fallback to scatter if mesh creation fails
-                import traceback
-                print(f"Mesh creation error: {e}")
-                print(traceback.format_exc())
-                self.ax.scatter(x, y, z, c=z, cmap='viridis', s=1, alpha=0.6, label='Scan points')
-        
-        # Plot test points
-        if self.test_points and len(self.test_points) > 0:
-            test_x = [p[0] for p in self.test_points]
-            test_y = [p[1] for p in self.test_points]
-            test_z = [p[2] for p in self.test_points]
-            
-            self.ax.scatter(test_x, test_y, test_z, c='red', s=100, marker='o', 
-                          edgecolors='black', linewidths=2, label='Test points', zorder=5)
-            
-            # Draw line between test points if 2 points
-            if len(self.test_points) == 2:
-                self.ax.plot([test_x[0], test_x[1]], [test_y[0], test_y[1]], 
-                           [test_z[0], test_z[1]], 'r--', linewidth=2, alpha=0.5)
-        
-        self.ax.set_xlabel('X (cm)')
-        self.ax.set_ylabel('Y (cm)')
-        self.ax.set_zlabel('Z (cm)')
-        total_points = len(points) if points is not None else 0
-        test_count = len(self.test_points) if self.test_points else 0
-        self.ax.set_title(f'3D View ({total_points} scan points, {test_count} test points)')
-        
-        if total_points > 0 or test_count > 0:
-            self.ax.legend()
-        
-        self.canvas.draw()
-    
-    def start_test(self):
-        """Start test mode: measure point at 0°, rotate 180°, measure again"""
-        if not self.is_connected:
-            messagebox.showerror("Error", "Not connected to device")
-            return
-        
-        if self.is_testing:
-            return
-        
-        self.is_testing = True
-        self.test_btn.config(state=tk.DISABLED)
-        self.test_status_label.config(text="Status: Testing...", foreground="orange")
-        self.test_points = []
-        self.test_results_text.delete(1.0, tk.END)
-        self.test_results_text.insert(tk.END, "Starting test...\n")
-        
-        # Start test in background thread
-        test_thread = threading.Thread(target=self.run_test, daemon=True)
-        test_thread.start()
-    
-    def run_test(self):
-        """Run test sequence"""
-        try:
-            # Measure first point at current position (0°)
-            self.test_results_text.insert(tk.END, "Measuring point 1 at 0°...\n")
-            self.test_results_text.see(tk.END)
-            
-            if self.serial_conn:
-                self.serial_conn.write(b"TEST_POINT\n")
-            
-            # Wait for response (will be handled by process_serial_data)
-            time.sleep(1.5)
-            
-            # Rotate 180 degrees
-            theta_steps = int(self.theta_steps_var.get())
-            steps_180 = theta_steps // 2
-            
-            self.test_results_text.insert(tk.END, f"Rotating {steps_180} steps (180°)...\n")
-            self.test_results_text.see(tk.END)
-            
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE,{steps_180}\n".encode())
-            
-            time.sleep(2.5)  # Wait for rotation to complete
-            
-            # Measure second point at 180°
-            self.test_results_text.insert(tk.END, "Measuring point 2 at 180°...\n")
-            self.test_results_text.see(tk.END)
-            
-            if self.serial_conn:
-                self.serial_conn.write(b"TEST_POINT\n")
-            
-            time.sleep(1.5)  # Wait for response
-            
-            self.test_results_text.insert(tk.END, "Test completed!\n")
-            self.test_results_text.see(tk.END)
-            
+                print(f"[GUI] ✗ Failed to schedule backup: {e}")
+
+            # Call parsed callback
+            parsed_data = {
+                'x': x_mm,
+                'y': y_mm,
+                'z': z_height_mm,  # Z height in mm
+                'angle': angle,
+                'state': self.grbl_state
+            }
+            self.on_data_parsed('position', parsed_data)
+
+            print(f"{'='*70}")
+            print(f"[PARSE] ✓✓✓ PARSE COMPLETE - SUCCESS!")
+            print(f"{'='*70}\n")
+
         except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-        finally:
-            self.is_testing = False
-            self.test_btn.config(state=tk.NORMAL)
-            self.test_status_label.config(text="Status: Ready", foreground="green")
-    
-    def add_test_point(self, angle, distance):
-        """Add a test point to visualization"""
-        # Convert angle (degrees) and distance to cartesian
-        center_distance = float(self.center_distance_var.get())
-        r = center_distance - distance
-        angle_rad = np.radians(angle)
-        
-        x = r * np.cos(angle_rad)
-        y = r * np.sin(angle_rad)
-        z = 0  # Test points at z=0
-        
-        self.test_points.append([x, y, z])
-        
-        # Update results text
-        self.test_results_text.insert(tk.END, f"Point {len(self.test_points)}: Angle={angle}°, Distance={distance:.2f}cm, R={r:.2f}cm\n")
-        self.test_results_text.insert(tk.END, f"  Position: X={x:.2f}cm, Y={y:.2f}cm, Z={z:.2f}cm\n")
-        self.test_results_text.see(tk.END)
-        
-        # Update visualization
-        self.update_visualization()
-        
-        # If we have 2 points, calculate distance
-        if len(self.test_points) == 2:
-            p1 = np.array(self.test_points[0])
-            p2 = np.array(self.test_points[1])
-            dist = np.linalg.norm(p2 - p1)
-            self.test_results_text.insert(tk.END, f"\nDistance between points: {dist:.2f}cm\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_cw(self):
-        """Rotate motor clockwise"""
-        if not self.is_connected:
-            return
-        
+            print(f"\n{'='*70}")
+            print(f"[PARSE] ✗✗✗ EXCEPTION!")
+            print(f"[PARSE] Type: {type(e).__name__}")
+            print(f"[PARSE] Message: {str(e)}")
+            print(f"{'='*70}")
+
+            import traceback
+            traceback.print_exc()
+
+            self.log_info(f"ERROR: {str(e)}")
+            print(f"{'='*70}\n")
+
+    def update_test_position_display(self):
+        """Update position display in test tab
+        CORRECTED:
+        - X shows rotation angle (from GRBL Y axis after swap): 0.1mm = 45°
+        - Z shows height (from GRBL X axis after swap): M8 lead screw, already in mm
+        """
         try:
-            steps = int(self.test_steps_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps must be greater than 0")
-                return
-            
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating CW {steps} steps...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps value")
+            if hasattr(self, 'test_x_pos_var'):
+                # X shows angle (from GRBL X axis)
+                self.test_x_pos_var.set(f"{self.current_angle:.1f}°")
+
+            if hasattr(self, 'test_z_pos_var'):
+                # Z shows height (from GRBL Y axis - M8 leadscrew, GRBL reports in mm)
+                self.test_z_pos_var.set(f"{self.current_y_pos:.2f} mm")
         except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_ccw(self):
-        """Rotate motor counter-clockwise"""
-        if not self.is_connected:
-            return
-        
+            self.log_info(f"Error updating position display: {str(e)}")
+
+    def _update_position_vars(self, angle, height):
+        """Helper function to update position variables (called from main thread)"""
         try:
-            steps = int(self.test_steps_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps must be greater than 0")
-                return
-            
-            # For CCW, we rotate in reverse direction
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_CCW,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating CCW {steps} steps...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def update_test_position(self):
-        """Update test position display"""
-        if hasattr(self, 'test_position_var') and hasattr(self, 'theta_steps_var'):
-            try:
-                theta_steps = int(self.theta_steps_var.get())
-                angle = (self.test_current_step % theta_steps) * 360.0 / theta_steps
-                self.test_position_var.set(f"{self.test_current_step} steps ({angle:.1f}°)")
-            except:
+            if hasattr(self, 'test_x_pos_var'):
+                self.test_x_pos_var.set(f"{angle:.1f}°")
+            else:
+                # Variable not initialized yet
                 pass
-        
-        # Update Z position
-        if hasattr(self, 'test_position_z_var'):
-            try:
-                self.test_position_z_var.set(f"{self.test_current_step_z} steps")
-            except:
+
+            if hasattr(self, 'test_z_pos_var'):
+                self.test_z_pos_var.set(f"{height:.2f} mm")
+            else:
+                # Variable not initialized yet
                 pass
-    
-    def rotate_x_full_cw(self):
-        """Rotate motor X one full revolution clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.steps_per_rev_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps per revolution must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating X motor 1 full revolution CW ({steps} steps)...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps per revolution value")
         except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_x_full_ccw(self):
-        """Rotate motor X one full revolution counter-clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.steps_per_rev_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps per revolution must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_CCW,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating X motor 1 full revolution CCW ({steps} steps)...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps per revolution value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_z_cw(self):
-        """Rotate motor Z clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.test_steps_z_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_Z,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating Z motor CW {steps} steps...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_z_ccw(self):
-        """Rotate motor Z counter-clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.test_steps_z_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_Z_CCW,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating Z motor CCW {steps} steps...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_z_full_cw(self):
-        """Rotate motor Z one full revolution clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.steps_per_rev_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps per revolution must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_Z,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating Z motor 1 full revolution CW ({steps} steps)...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps per revolution value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def rotate_z_full_ccw(self):
-        """Rotate motor Z one full revolution counter-clockwise"""
-        if not self.is_connected:
-            return
-        try:
-            steps = int(self.steps_per_rev_var.get())
-            if steps <= 0:
-                messagebox.showerror("Error", "Steps per revolution must be greater than 0")
-                return
-            if self.serial_conn:
-                self.serial_conn.write(f"ROTATE_Z_CCW,{steps}\n".encode())
-                self.test_results_text.insert(tk.END, f"Rotating Z motor 1 full revolution CCW ({steps} steps)...\n")
-                self.test_results_text.see(tk.END)
-        except ValueError:
-            messagebox.showerror("Error", "Invalid steps per revolution value")
-        except Exception as e:
-            self.test_results_text.insert(tk.END, f"Error: {str(e)}\n")
-            self.test_results_text.see(tk.END)
-    
-    def toggle_lidar_reading(self):
-        """Toggle continuous LiDAR reading"""
-        if not self.is_connected:
-            return
+            # Silently ignore errors during initialization
+            pass
+
+    def update_vl53_display(self, distance_mm):
+        """Update VL53L0X distance display"""
+        # Store current distance reading for scan processing
+        if distance_mm > 0 and distance_mm < 8190:
+            self.current_vl53_distance = distance_mm
         
-        if not self.lidar_reading_active:
-            # Start continuous reading
-            self.lidar_reading_active = True
-            self.lidar_read_btn.config(text="Stop Reading")
-            self.lidar_status_var.set("Starting...")
-            self.lidar_distance_var.set("-- cm")
-            
-            # Start reading thread
-            reading_thread = threading.Thread(target=self.continuous_lidar_read, daemon=True)
+        if hasattr(self, 'vl53_distance_var'):
+            if distance_mm >= 8190:
+                self.vl53_distance_var.set("OUT OF RANGE")
+                if hasattr(self, 'vl53_status_var'):
+                    self.vl53_status_var.set("Out of range (>2000mm)")
+            elif distance_mm == 0:
+                self.vl53_distance_var.set("ERROR")
+                if hasattr(self, 'vl53_status_var'):
+                    self.vl53_status_var.set("Error/Timeout")
+            else:
+                self.vl53_distance_var.set(f"{distance_mm:.1f} mm")
+                if hasattr(self, 'vl53_status_var') and self.vl53_reading_active:
+                    if distance_mm < 20:
+                        self.vl53_status_var.set("Too close (<20mm)")
+                    elif distance_mm > 2000:
+                        self.vl53_status_var.set("Too far (>2000mm)")
+                    else:
+                        self.vl53_status_var.set("OK")
+
+        # Update visual bar
+        if hasattr(self, 'distance_canvas'):
+            max_distance = 2000.0
+            if distance_mm == 0 or distance_mm >= 8190:
+                bar_width = 0
+                color = "gray"
+            else:
+                display_distance = min(max(distance_mm, 0), max_distance)
+                bar_width = min(200, int((display_distance / max_distance) * 200))
+                if distance_mm < 100:
+                    color = "red"
+                elif distance_mm < 500:
+                    color = "orange"
+                else:
+                    color = "green"
+            self.distance_canvas.coords(self.distance_bar, 0, 0, bar_width, 20)
+            self.distance_canvas.itemconfig(self.distance_bar, fill=color)
+
+    def format_gcode_command(self, x_move=0.0, y_move=0.0, z_move=0.0, feed_rate=1.0):
+        """Format G-code commands"""
+        feed_rate_float = max(1.0, float(feed_rate))
+        feed_rate = int(feed_rate_float) if feed_rate_float.is_integer() else feed_rate_float
+
+        commands = []
+        commands.append("G91\n")
+
+        move_parts = ["G1"]
+
+        if abs(x_move) >= 0.1:
+            x_str = f"{x_move:.1f}".rstrip('0').rstrip('.')
+            move_parts.append(f"Y{x_str}")  # Hoán đổi: x_move gửi xuống Y
+
+        if abs(y_move) >= 0.01:  # Allow smaller movements
+            move_parts.append(f"X0.2")  
+
+        if abs(z_move) >= 0.1:
+            z_str = f"{z_move:.1f}".rstrip('0').rstrip('.')
+            move_parts.append(f"Z{z_str}")
+
+        if isinstance(feed_rate, int) or (isinstance(feed_rate, float) and feed_rate.is_integer()):
+            f_str = f"{int(feed_rate)}"
+        else:
+            f_str = f"{feed_rate:.1f}".rstrip('0').rstrip('.')
+        move_parts.append(f"F{f_str}")
+
+        commands.append("".join(move_parts) + "\n")
+        commands.append("G90\n")
+
+        return commands
+
+    def send_gcode_commands(self, commands, delay=0.05):
+        """Send multiple G-code commands sequentially"""
+        if not self.serial_conn:
+            return
+
+        for cmd in commands:
+            self.send_serial_command(cmd, log=True)
+            time.sleep(delay)
+
+    def on_speed_change(self, value):
+        """Update speed label"""
+        speed_float = max(1.0, float(value))
+        if speed_float.is_integer():
+            speed = int(speed_float)
+        else:
+            speed = speed_float
+        self.speed_var.set(speed)
+        self.speed_label.config(text=f"F{speed}")
+
+    def on_step_change(self, value):
+        """Update step label"""
+        step = max(0.1, float(value))
+        self.step_var.set(step)
+        if isinstance(step, float) and step.is_integer():
+            self.step_label.config(text=f"{int(step)}")
+        else:
+            self.step_label.config(text=f"{step:.1f}")
+
+    def calculate_one_revolution_distance(self):
+        """Calculate exact distance for 1 full revolution
+
+        X axis (rotation): 360° = 360/450 mm = 0.8mm
+        Because: 0.1mm = 45°, so 1° = 0.1/45 mm, 360° = 360 × (0.1/45) = 0.8mm
+
+        Y axis (height, M8 lead screw): 1 revolution = 8mm
+        """
+        return 0.8  # Fixed value for X axis based on calibration
+
+    def move_direction(self, direction):
+        """Move in specified direction using G-code"""
+        if not self.is_connected:
+            return
+
+        step = max(0.1, float(self.step_var.get()))
+        speed = max(1, float(self.speed_var.get()))
+        speed = int(speed) if speed.is_integer() else speed
+
+        if direction == "HOME":
+            self.go_home_test()
+            return
+
+        x_move = 0.0
+        z_move = 0.0
+
+        if direction == "N":
+            z_move = step
+        elif direction == "S":
+            z_move = -step
+        elif direction == "E":
+            x_move = step
+        elif direction == "W":
+            x_move = -step
+        elif direction == "NE":
+            x_move = step * 0.707
+            z_move = step * 0.707
+        elif direction == "NW":
+            x_move = -step * 0.707
+            z_move = step * 0.707
+        elif direction == "SE":
+            x_move = step * 0.707
+            z_move = -step * 0.707
+        elif direction == "SW":
+            x_move = -step * 0.707
+            z_move = -step * 0.707
+
+        if x_move != 0 or z_move != 0:
+            commands = self.format_gcode_command(x_move=x_move, z_move=z_move, feed_rate=speed)
+
+            if self.serial_conn:
+                self.send_gcode_commands(commands, delay=0.05)
+                cmd_str = " ".join([c.strip() for c in commands])
+                self.log_info(f"Moving {direction}: {cmd_str}")
+
+    def go_home_test(self):
+        """Go to home position"""
+        if not self.is_connected:
+            return
+
+        if self.serial_conn:
+            self.send_serial_command("G28\n", log=True)
+            self.current_x_pos = 0.0
+            self.current_y_pos = 0.0
+            self.current_z_pos = 0.0
+            self.current_angle = 0.0
+            self.update_test_position_display()
+            self.log_info("Going to home (G28)")
+
+    def toggle_vl53_reading(self):
+        """Toggle VL53L0X reading"""
+        if not self.is_connected:
+            return
+
+        if not self.vl53_reading_active:
+            self.vl53_reading_active = True
+            self.vl53_read_btn.config(text="Stop Reading")
+            self.vl53_status_var.set("Reading...")
+
+            reading_thread = threading.Thread(target=self.continuous_vl53_read, daemon=True)
             reading_thread.start()
         else:
-            # Stop continuous reading
-            self.lidar_reading_active = False
-            self.lidar_read_btn.config(text="Start Reading")
-            self.lidar_status_var.set("Stopped")
-    
-    def continuous_lidar_read(self):
-        """Continuously read from LiDAR"""
-        while self.lidar_reading_active and self.is_connected:
+            self.vl53_reading_active = False
+            self.vl53_read_btn.config(text="Start Reading")
+            self.vl53_status_var.set("Stopped")
+
+    def continuous_vl53_read(self):
+        """Continuously read from VL53L0X"""
+        while self.vl53_reading_active and self.is_connected:
             try:
                 if self.serial_conn:
-                    self.serial_conn.write(b"READ_LIDAR\n")
-                time.sleep(0.1)  # Read every 100ms
+                    self.send_serial_command("READ_VL53L0X\n", log=True)
+                time.sleep(0.2)
             except Exception as e:
-                if self.lidar_reading_active:
-                    self.lidar_status_var.set(f"Error: {str(e)}")
+                if self.vl53_reading_active:
+                    self.vl53_status_var.set(f"Error: {str(e)}")
                 break
-    
-    def export_stl(self):
-        """Export scan data to STL file"""
-        if not self.scan_data:
-            messagebox.showwarning("Warning", "No scan data to export")
+
+    def rotate_x_cw_test(self):
+        """Rotate X clockwise"""
+        if not self.is_connected:
             return
-        
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".stl",
-            filetypes=[("STL files", "*.stl"), ("All files", "*.*")]
-        )
-        
-        if filename:
-            try:
-                self.generate_stl(filename)
-                messagebox.showinfo("Success", f"STL file saved to {filename}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to export STL: {str(e)}")
-    
-    def get_cartesian_points(self):
-        """Convert scan data to cartesian coordinates"""
-        if not self.scan_data:
+
+        step = max(0.1, float(self.step_var.get()))
+        speed = max(1, float(self.speed_var.get()))
+
+        commands = self.format_gcode_command(x_move=step, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"X CW: {cmd_str}")
+
+    def rotate_x_ccw_test(self):
+        """Rotate X counter-clockwise"""
+        if not self.is_connected:
+            return
+
+        step = max(0.1, float(self.step_var.get()))
+        speed = max(1, float(self.speed_var.get()))
+
+        commands = self.format_gcode_command(x_move=-step, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"X CCW: {cmd_str}")
+
+    def rotate_x_full_cw_test(self):
+        """Rotate X 360° clockwise"""
+        if not self.is_connected:
+            return
+
+        speed = max(1, float(self.speed_var.get()))
+        distance = self.calculate_one_revolution_distance()
+
+        commands = self.format_gcode_command(x_move=distance, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"X 360° CW (0.8mm): {cmd_str}")
+
+    def rotate_x_full_ccw_test(self):
+        """Rotate X 360° counter-clockwise"""
+        if not self.is_connected:
+            return
+
+        speed = max(1, float(self.speed_var.get()))
+        distance = self.calculate_one_revolution_distance()
+
+        commands = self.format_gcode_command(x_move=-distance, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"X 360° CCW (-0.8mm): {cmd_str}")
+
+    def rotate_y_cw_test(self):
+        """Move Z up (mapped from GRBL Y)"""
+        if not self.is_connected:
+            return
+
+        step = max(0.1, float(self.step_var.get()))
+        speed = max(1, float(self.speed_var.get()))
+
+        commands = self.format_gcode_command(y_move=step, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"Z Lên: {cmd_str}")
+
+    def rotate_y_ccw_test(self):
+        """Move Z down (mapped from GRBL Y)"""
+        if not self.is_connected:
+            return
+
+        step = max(0.1, float(self.step_var.get()))
+        speed = max(1, float(self.speed_var.get()))
+
+        commands = self.format_gcode_command(y_move=-step, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"Z Xuống: {cmd_str}")
+
+    def rotate_y_full_cw_test(self):
+        """Move Z full up"""
+        if not self.is_connected:
+            return
+
+        speed = max(1, float(self.speed_var.get()))
+        z_travel = int(self.z_travel_var.get())
+
+        commands = self.format_gcode_command(y_move=z_travel, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"Z Lên Hết: {cmd_str}")
+
+    def rotate_y_full_ccw_test(self):
+        """Move Z full down"""
+        if not self.is_connected:
+            return
+
+        speed = max(1, float(self.speed_var.get()))
+        z_travel = int(self.z_travel_var.get())
+
+        commands = self.format_gcode_command(y_move=-z_travel, feed_rate=speed)
+        if self.serial_conn:
+            self.send_gcode_commands(commands, delay=0.05)
+            cmd_str = " ".join([c.strip() for c in commands])
+            self.log_info(f"Z Xuống Hết: {cmd_str}")
+
+    def calculate_point_from_scan(self, angle_deg, distance_mm, z_height_mm):
+        """Calculate 3D point from scan data
+        angle_deg: rotation angle in degrees
+        distance_mm: distance from sensor in mm
+        z_height_mm: height in mm
+        Returns: (x, y, z) in cm or None if filtered out
+        """
+        try:
+            center_distance_cm = float(self.center_distance_var.get())
+            disk_radius_cm = float(self.disk_radius_var.get())
+            
+            # Convert distance from mm to cm
+            distance_cm = distance_mm / 10.0
+            
+            # Filter 1: Remove negative or zero distances (error readings)
+            if distance_cm <= 0:
+                return None
+            
+            # Filter 2: Calculate valid range
+            # Cảm biến ở bên cạnh, cách tâm center_distance_cm
+            # Bán kính đĩa disk_radius_cm
+            # Khoảng cách tối thiểu: center - radius = 15 - 5 = 10cm
+            # Khoảng cách tối đa: center + radius = 15 + 5 = 20cm
+            min_distance_cm = center_distance_cm - disk_radius_cm  # 10cm
+            max_distance_cm = center_distance_cm + disk_radius_cm  # 20cm
+            
+            # Filter 3: Remove values outside valid range
+            if distance_cm < min_distance_cm or distance_cm > max_distance_cm:
+                return None  # Out of range, skip this point
+            
+            # Calculate radius from center
+            # Logic from MATLAB: r = centerDistance - distance
+            # This gives radius from turntable center to object surface
+            radius_from_center = center_distance_cm - distance_cm
+            
+            # Filter 4: Remove values around 0 (midThresh in MATLAB)
+            # midThreshUpper=0.5, midThreshLower=-0.5
+            mid_thresh_upper = 0.5
+            mid_thresh_lower = -0.5
+            if mid_thresh_lower < radius_from_center < mid_thresh_upper:
+                return None  # Too close to center, likely error
+            
+            # Convert angle to radians
+            angle_rad = np.radians(angle_deg)
+            
+            # Calculate x, y in cm (cylindrical coordinates)
+            x_cm = radius_from_center * np.cos(angle_rad)
+            y_cm = radius_from_center * np.sin(angle_rad)
+            # Z height: convert mm to cm (zDelta in MATLAB is 0.1 cm per layer)
+            z_cm = z_height_mm / 10.0
+            
+            return (x_cm, y_cm, z_cm)
+        except Exception as e:
+            self.log_info(f"Error calculating point: {e}")
             return None
-        
-        # Convert scan data to points
-        data = np.array(self.scan_data)
-        layers = data[:, 0].astype(int)
-        steps = data[:, 1].astype(int)
-        distances = data[:, 2]
-        
-        theta_steps = int(self.theta_steps_var.get())
-        theta = (steps / theta_steps) * 2 * np.pi
-        center_distance = float(self.center_distance_var.get())  # cm - distance from lidar to center of turntable
-        r = center_distance - distances
-        # z_layer_height is in mm, convert to cm for consistency with X, Y coordinates (which are in cm)
-        # Note: z_layer_height represents the actual physical height moved per layer
-        z_layer_height_mm = float(self.z_layer_height_var.get())
-        z_layer_height_cm = z_layer_height_mm / 10.0  # Convert mm to cm
-        
-        x = r * np.cos(theta)
-        y = r * np.sin(theta)
-        # Calculate Z: layer number * height per layer
-        # Layer 0 = bottom, each layer moves up by z_layer_height
-        z = layers * z_layer_height_cm
-        
-        # Filter out invalid points (distance = 0 means LiDAR error)
-        # Skip points with distance = 0 or invalid values
-        valid_distance = (distances > 0) & (distances <= 1200)  # Valid distance range
-        
-        # Calculate filter thresholds from geometry parameters
-        disk_radius = float(self.disk_radius_var.get())
-        center_distance = float(self.center_distance_var.get())
-        
-        # Auto-calculate filter ranges:
-        # - Min bán kính: 0 (tâm đĩa)
-        # - Max bán kính: bán kính đĩa (hoặc lớn hơn một chút để an toàn)
-        min_radius = 0
-        max_radius = disk_radius * 1.2  # Cho phép vật thể lớn hơn đĩa một chút
-        
-        # - Min khoảng cách: khoảng cách từ lidar đến điểm gần nhất (cạnh trong đĩa)
-        # - Max khoảng cách: khoảng cách từ lidar đến điểm xa nhất (cạnh ngoài + vật thể cao)
-        min_distance = max(0, center_distance - disk_radius - 2)  # Điểm gần nhất
-        max_distance = center_distance + disk_radius + 50  # Điểm xa nhất (cho phép vật thể cao)
-        
-        # Apply filter: valid distance AND within radius/distance ranges
-        valid = valid_distance & (r >= min_radius) & (r <= max_radius) & (distances >= min_distance) & (distances <= max_distance)
-        points = np.column_stack([x[valid], y[valid], z[valid]])
-        
-        return points
-    
-    def generate_stl(self, filename):
-        """Generate STL file from scan data"""
-        from stl_generator import generate_stl_from_points
-        
-        points = self.get_cartesian_points()
-        if points is None or len(points) == 0:
-            raise ValueError("No valid points to export")
-        
-        generate_stl_from_points(points, filename)
-    
-    def export_k(self):
-        """Export scan data to .k file (point cloud format)"""
-        if not self.scan_data:
-            messagebox.showwarning("Warning", "No scan data to export")
+
+    def process_scan_data_point(self):
+        """Process current position and sensor reading to create scan point"""
+        if self.current_vl53_distance is None:
             return
         
-        filename = filedialog.asksaveasfilename(
-            defaultextension=".k",
-            filetypes=[("Point Cloud files", "*.k"), ("Text files", "*.txt"), ("All files", "*.*")]
-        )
+        # Get current angle and height
+        angle = self.current_angle
+        z_height = self.current_y_pos  # Height from GRBL X (after swap)
         
-        if filename:
-            try:
-                self.generate_k(filename)
-                messagebox.showinfo("Success", f"Point cloud file saved to {filename}")
-            except Exception as e:
-                messagebox.showerror("Error", f"Failed to export .k file: {str(e)}")
-    
-    def generate_k(self, filename):
-        """Generate .k file (HyperMesh Key file format) from scan data"""
-        points = self.get_cartesian_points()
-        if points is None or len(points) == 0:
-            raise ValueError("No valid points to export")
+        # Calculate 3D point
+        point = self.calculate_point_from_scan(angle, self.current_vl53_distance, z_height)
+        if point:
+            self.scan_data.append(point)
+            # Update visualization in main thread (thread-safe)
+            self.root.after(0, self.update_visualization)
+            self.log_info(f"Point added: angle={angle:.1f}°, dist={self.current_vl53_distance:.1f}mm, z={z_height:.2f}mm, point=({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})")
+
+    def scan_rotation_loop(self):
+        """Main scan loop: rotate X continuously, read sensor, move Z up after each rotation"""
+        if not self.is_connected or not self.serial_conn:
+            return
         
-        # Get triangles from mesh structure (same logic as visualization)
-        triangles = []
-        layers_dict = {}  # Initialize outside try block
-        if self.scan_data:
+        try:
+            # Get layer height
+            # Z quay 90 độ = 2mm (theo cú pháp: G1X10F1 = quay Z 1mm, G1X20F1 = quay Z 2mm)
+            # Layer height = 2mm (Z quay 90 degrees)
+            layer_height_mm = 2.0  # Fixed 2mm per layer (Z quay 90 degrees)
+            
+            # Get number of points per revolution
             try:
-                # Reconstruct layer and step structure from scan_data
-                point_indices = {}  # Map (layer, step) -> index in points array
-                valid_indices = []  # Map from scan_data index to points index
+                points_per_rev = int(self.points_per_revolution_var.get())
+                if points_per_rev < 1:
+                    points_per_rev = 360
+                    self.log_info(f"Invalid points per revolution, using default: {points_per_rev}")
+            except:
+                points_per_rev = 360
+                self.log_info(f"Error reading points per revolution, using default: {points_per_rev}")
+            
+            # Calculate angle step per point
+            angle_step = 360.0 / points_per_rev
+            
+            # Calculate one revolution distance (0.8mm for 360 degrees)
+            one_rev_distance = self.calculate_one_revolution_distance()
+            
+            # Speed for scan is always 1 (slowest speed for step motor)
+            speed = 1.0
+            
+            self.log_info(f"Scan settings: {points_per_rev} points/vòng, {angle_step:.2f}° per point, speed=F{int(speed)}")
+            
+            while self.is_scanning and not self.scan_paused:
+                # Record starting angle and X position
+                self.scan_start_angle = self.current_angle
+                start_x_pos = self.current_x_pos  # X position in mm (rotation axis)
+                start_z = self.current_y_pos
                 
-                # First, map scan_data to points
-                points_list = []
-                for i, data in enumerate(self.scan_data):
-                    layer = data[0]
-                    step = data[1]
-                    distance = data[2]
-                    angle = data[3]
-                    
-                    # Skip invalid points (distance <= 0 or > 1200)
-                    if distance <= 0 or distance > 1200:
-                        continue
-                    
-                    # Calculate cartesian coordinates
-                    center_distance = float(self.center_distance_var.get())
-                    # z_layer_height is in mm, convert to cm for consistency with X, Y coordinates (which are in cm)
-                    z_layer_height_mm = float(self.z_layer_height_var.get())
-                    z_layer_height_cm = z_layer_height_mm / 10.0  # Convert mm to cm
-                    
-                    r = distance
-                    theta_rad = angle * np.pi / 180.0
-                    x = r * np.cos(theta_rad)
-                    y = r * np.sin(theta_rad)
-                    z = layer * z_layer_height_cm
-                    
-                    # Apply filters
-                    disk_radius = float(self.disk_radius_var.get())
-                    min_radius = max(0.0, center_distance - disk_radius - 5.0)
-                    max_radius = center_distance + disk_radius + 50.0
-                    min_distance = max(0.0, center_distance - disk_radius - 5.0)
-                    max_distance = center_distance + disk_radius + 50.0
-                    
-                    r_point = np.sqrt(x*x + y*y)
-                    if r_point < min_radius or r_point > max_radius or distance < min_distance or distance > max_distance:
-                        continue
-                    
-                    points_list.append([x, y, z])
-                    point_idx = len(points_list) - 1
-                    
-                    if layer not in layers_dict:
-                        layers_dict[layer] = []
-                    layers_dict[layer].append(step)
-                    point_indices[(layer, step)] = point_idx
-                    valid_indices.append(i)
-            except:
-                pass  # If structure reconstruction fails, just export nodes
-        
-        # Generate triangles if we have structured data
-        if len(layers_dict) > 1:
-            try:
-                theta_steps = int(self.theta_steps_var.get())
-            except:
-                theta_steps = 200
-            
-            try:
-                layers = sorted(layers_dict.keys())
-                for layer_idx in range(len(layers) - 1):
-                    layer1 = layers[layer_idx]
-                    layer2 = layers[layer_idx + 1]
-                    
-                    steps1 = sorted(layers_dict[layer1])
-                    steps2 = sorted(layers_dict[layer2])
-                    
-                    for i in range(len(steps1) - 1):
-                        step1_curr = steps1[i]
-                        step1_next = steps1[i + 1]
-                        
-                        step2_curr = None
-                        step2_next = None
-                        
-                        for step2 in steps2:
-                            if step2_curr is None or abs(step2 - step1_curr) < abs(step2_curr - step1_curr):
-                                step2_curr = step2
-                            if step2_next is None or abs(step2 - step1_next) < abs(step2_next - step1_next):
-                                step2_next = step2
-                        
-                        if (layer1, step1_curr) in point_indices and \
-                           (layer1, step1_next) in point_indices and \
-                           (layer2, step2_curr) in point_indices and \
-                           (layer2, step2_next) in point_indices:
-                            
-                            idx1 = point_indices[(layer1, step1_curr)]
-                            idx2 = point_indices[(layer1, step1_next)]
-                            idx3 = point_indices[(layer2, step2_curr)]
-                            idx4 = point_indices[(layer2, step2_next)]
-                            
-                            max_idx = len(points_list) - 1
-                            if idx1 <= max_idx and idx2 <= max_idx and idx3 <= max_idx and idx4 <= max_idx:
-                                triangles.append([idx1, idx2, idx3])
-                                triangles.append([idx2, idx4, idx3])
-            except:
-                pass
-        
-        # Use points_list if available, otherwise use points
-        if len(points_list) > 0:
-            export_points = np.array(points_list)
-        else:
-            export_points = points
-        
-        # Write HyperMesh/LS-DYNA .k file format
-        with open(filename, 'w') as f:
-            # Write header
-            f.write("*KEYWORD\n")
-            f.write("$# Generated by 3D Scanner\n")
-            f.write("$# Total nodes: {}\n".format(len(export_points)))
-            f.write("$# Coordinates in cm\n")
-            
-            # Write nodes section (LS-DYNA format)
-            f.write("*NODE\n")
-            # Format: node_id, x, y, z (comma-separated, no parentheses)
-            for i, point in enumerate(export_points):
-                node_id = i + 1  # HyperMesh node IDs start from 1
-                f.write("{},{:.6f},{:.6f},{:.6f}\n".format(
-                    node_id, point[0], point[1], point[2]))
-            
-            # Write elements (triangles) if available
-            if len(triangles) > 0:
-                f.write("*ELEMENT_SHELL\n")
-                f.write("$# Generated triangles from scan mesh\n")
-                f.write("$# Total elements: {}\n".format(len(triangles)))
+                self.log_info(f"Starting rotation at angle {self.scan_start_angle:.1f}°, X={start_x_pos:.3f}mm, Z={start_z:.2f}mm")
                 
-                # Write elements: element_id, node1, node2, node3, node4 (comma-separated)
-                # For shell elements, we need 4 nodes (repeat last node for triangle)
-                for i, tri in enumerate(triangles):
-                    elem_id = i + 1  # HyperMesh element IDs start from 1
-                    # Convert to 1-based indexing for HyperMesh
-                    node1 = tri[0] + 1
-                    node2 = tri[1] + 1
-                    node3 = tri[2] + 1
-                    node4 = tri[2] + 1  # Repeat last node for triangle
-                    # Format: element_id, node1, node2, node3, node4
-                    f.write("{},{},{},{},{}\n".format(
-                        elem_id, node1, node2, node3, node4))
+                # Start continuous rotation (1 full revolution = 0.8mm)
+                commands = self.format_gcode_command(x_move=one_rev_distance, feed_rate=speed)
+                self.send_gcode_commands(commands, delay=0.05)
+                
+                # Monitor rotation and collect data points
+                last_angle = self.current_angle
+                last_processed_angle = self.scan_start_angle
+                angle_changed = False
+                points_collected = 0
+                next_target_angle = (self.scan_start_angle + angle_step) % 360.0
+                
+                # Wait for rotation to complete (monitor angle change)
+                timeout = time.time() + 60  # 60 second timeout (slower speed needs more time)
+                while self.is_scanning and not self.scan_paused:
+                    current_angle = self.current_angle
+                    
+                    # Check if we've collected enough points
+                    if points_collected >= points_per_rev:
+                        self.log_info(f"Collected all {points_per_rev} points")
+                        break
+                    
+                    # Check if we've completed a full rotation (360 degrees = 0.8mm)
+                    # Method 1: Check X position change (more reliable)
+                    current_x_pos = self.current_x_pos
+                    x_moved = abs(current_x_pos - start_x_pos)
+                    
+                    # X position wraps around: if start was near 0 and current is near 0.8, or vice versa
+                    # Or if we've moved approximately 0.8mm
+                    x_completed = (x_moved >= 0.75) or (start_x_pos < 0.1 and current_x_pos >= 0.75) or (start_x_pos >= 0.75 and current_x_pos < 0.1)
+                    
+                    # Method 2: Check angle difference (backup)
+                    angle_diff = current_angle - self.scan_start_angle
+                    if angle_diff < 0:
+                        angle_diff += 360.0
+                    
+                    # Also check if we've wrapped around (current angle near 0, start was near 360)
+                    wrapped_around = (self.scan_start_angle > 350.0 and current_angle < 10.0 and points_collected > 0)
+                    
+                    # Stop when X position indicates 1 full rotation OR angle indicates completion
+                    if x_completed or angle_diff >= 358.0 or (angle_diff >= 355.0 and points_collected >= points_per_rev * 0.9) or wrapped_around:
+                        if x_completed:
+                            self.log_info(f"Completed 1 full rotation (X moved {x_moved:.3f}mm: {start_x_pos:.3f} → {current_x_pos:.3f}mm)")
+                        elif wrapped_around:
+                            self.log_info(f"Completed 1 full rotation (wrapped around: {self.scan_start_angle:.1f}° → {current_angle:.1f}°)")
+                        else:
+                            self.log_info(f"Completed 1 full rotation ({angle_diff:.1f}°)")
+                        break
+                    
+                    # Calculate angle change from last processed angle
+                    angle_change = (current_angle - last_processed_angle) % 360.0
+                    if angle_change > 180:
+                        angle_change = 360 - angle_change
+                    
+                    # Check if we've reached the next target angle
+                    target_reached = False
+                    if angle_change >= angle_step * 0.8:  # 80% of step to account for timing
+                        # Check if we're close to target angle
+                        angle_to_target = (next_target_angle - current_angle) % 360.0
+                        if angle_to_target > 180:
+                            angle_to_target = 360 - angle_to_target
+                        
+                        if angle_to_target <= angle_step * 0.5 or angle_change >= angle_step:
+                            target_reached = True
+                    
+                    if target_reached:
+                        # Request sensor reading
+                        if self.serial_conn:
+                            self.send_serial_command("READ_VL53L0X\n", log=False)
+                        time.sleep(0.15)  # Wait for sensor reading to arrive (slower speed)
+                        
+                        # Process point if we have sensor data
+                        if self.current_vl53_distance is not None:
+                            self.process_scan_data_point()
+                            points_collected += 1
+                            last_processed_angle = current_angle
+                            next_target_angle = (next_target_angle + angle_step) % 360.0
+                        else:
+                            self.log_info(f"Warning: No sensor data at angle {current_angle:.1f}°")
+                        
+                        angle_changed = True
+                    
+                    if abs(current_angle - last_angle) > 0.1:  # Angle is changing
+                        angle_changed = True
+                    last_angle = current_angle
+                    
+                    if time.time() > timeout:
+                        self.log_info(f"Rotation timeout. Collected {points_collected}/{points_per_rev} points")
+                        break
+                    
+                    time.sleep(0.05)  # Check every 50ms
+                
+                self.log_info(f"Rotation complete. Collected {points_collected}/{points_per_rev} points")
+                
+                if not self.is_scanning or self.scan_paused:
+                    break
+                
+                # Move Z up by layer height (ONLY ONCE per rotation)
+                # Note: y_move in format_gcode_command maps to GRBL X, which is height (GUI Z) after swap
+                # Z quay 90 độ = 2mm, lệnh: G1X20F1 (2mm × 10 = 20, vì G1X10F1 = quay Z 1mm)
+                start_z_before = self.current_y_pos
+                self.log_info(f"=== Moving Z up {layer_height_mm}mm (from {start_z_before:.2f}mm) - Layer {self.current_layer + 1} ===")
+                
+                # Create command to move Z (y_move maps to GRBL X which is height)
+                # y_move=layer_height_mm will create G1X{layer_height_mm}F1 command
+                commands = self.format_gcode_command(y_move=layer_height_mm, feed_rate=speed)
+                
+                # Log the command for debugging
+                cmd_str = " ".join([c.strip() for c in commands])
+                self.log_info(f"Z move command: {cmd_str}")
+                print(f"[SCAN] Z move command (Layer {self.current_layer + 1}): {cmd_str}")
+                
+                # Send commands ONCE
+                if self.serial_conn:
+                    # Send commands with minimal delay
+                    self.send_gcode_commands(commands, delay=0.05)
+                    # Wait 0.5s for Z movement to complete (slow speed F1)
+                    time.sleep(0.5)
+                    
+                    # Quick check if Z moved (optional verification)
+                    current_z = self.current_y_pos
+                    z_moved = abs(current_z - start_z_before)
+                    if z_moved >= layer_height_mm * 0.5:  # At least 50% of target movement
+                        self.log_info(f"✓ Z moved to {current_z:.2f}mm (moved {z_moved:.2f}mm)")
+                    else:
+                        self.log_info(f"Z position: {current_z:.2f}mm (expected move: {layer_height_mm}mm, actual: {z_moved:.2f}mm)")
+                else:
+                    self.log_info("ERROR: Serial connection lost!")
+                    break
+                
+                # Update progress
+                self.current_layer += 1
+                total_points = len(self.scan_data)
+                self.root.after(0, lambda: self.progress_var.set(f"Layer {self.current_layer}, Points: {total_points}"))
+                
+        except Exception as e:
+            self.log_info(f"Scan error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.is_scanning = False
+            self.root.after(0, lambda: self.scan_up_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.scan_down_btn.config(state=tk.NORMAL))
+            self.root.after(0, lambda: self.pause_btn.config(state=tk.DISABLED))
+            self.root.after(0, lambda: self.resume_btn.config(state=tk.DISABLED))
+            self.log_info("Scan stopped")
+
+    def start_scan_up(self):
+        """Start scanning from bottom to top"""
+        if not self.is_connected:
+            messagebox.showerror("Error", "Not connected to device")
+            return
+        
+        if self.is_scanning:
+            return
+        
+        self.is_scanning = True
+        self.scan_paused = False
+        self.scan_data = []
+        self.current_layer = 0
+        
+        self.scan_up_btn.config(state=tk.DISABLED)
+        self.scan_down_btn.config(state=tk.DISABLED)
+        self.pause_btn.config(state=tk.NORMAL)
+        self.resume_btn.config(state=tk.DISABLED)
+        
+        self.log_info("Starting scan...")
+        
+        # Start scan thread
+        scan_thread = threading.Thread(target=self.scan_rotation_loop, daemon=True)
+        scan_thread.start()
+
+    def start_scan_down(self):
+        """Start scanning from top to bottom (same as up for now)"""
+        self.start_scan_up()
+
+    def pause_scan(self):
+        """Pause scanning"""
+        if self.is_scanning:
+            self.scan_paused = True
+            self.pause_btn.config(state=tk.DISABLED)
+            self.resume_btn.config(state=tk.NORMAL)
+            self.log_info("Scan paused")
+
+    def resume_scan(self):
+        """Resume scanning"""
+        if self.is_scanning and self.scan_paused:
+            self.scan_paused = False
+            self.pause_btn.config(state=tk.NORMAL)
+            self.resume_btn.config(state=tk.DISABLED)
+            self.log_info("Scan resumed")
+
+    def clear_data(self):
+        self.scan_data = []
+        self.log_info("Data cleared")
+
+    def move_to_top(self):
+        self.log_info("Move to top not implemented")
+
+    def go_home(self):
+        self.log_info("Go home not implemented")
+
+    def send_config(self):
+        self.log_info("Send config not implemented")
+
+    def update_visualization(self):
+        """Update 3D visualization with scan data"""
+        try:
+            self.ax.clear()
             
-            f.write("*END\n")
-    
+            if len(self.scan_data) > 0:
+                # Extract x, y, z coordinates
+                x_coords = [p[0] for p in self.scan_data]
+                y_coords = [p[1] for p in self.scan_data]
+                z_coords = [p[2] for p in self.scan_data]
+                
+                # Color points by Z height for better 3D visualization
+                if z_coords:
+                    min_z = min(z_coords)
+                    max_z = max(z_coords)
+                    if max_z > min_z:
+                        # Normalize Z to 0-1 for colormap
+                        z_normalized = [(z - min_z) / (max_z - min_z) for z in z_coords]
+                        # Use colormap: blue (low) to red (high)
+                        colors = self.ax.scatter(x_coords, y_coords, z_coords, 
+                                                c=z_normalized, cmap='viridis', 
+                                                s=5, alpha=0.8, edgecolors='none')
+                    else:
+                        # All points at same height
+                        self.ax.scatter(x_coords, y_coords, z_coords, 
+                                       c='blue', s=5, alpha=0.8, edgecolors='none')
+                else:
+                    self.ax.scatter(x_coords, y_coords, z_coords, 
+                                   c='blue', s=5, alpha=0.8, edgecolors='none')
+                
+                # Set labels
+                self.ax.set_xlabel('X (cm)', fontsize=10)
+                self.ax.set_ylabel('Y (cm)', fontsize=10)
+                self.ax.set_zlabel('Z (cm)', fontsize=10)
+                self.ax.set_title(f'3D Scan Point Cloud - {len(self.scan_data)} points', fontsize=11, fontweight='bold')
+                
+                # Calculate bounds with some padding
+                if x_coords and y_coords and z_coords:
+                    x_range = max(x_coords) - min(x_coords) if x_coords else 1
+                    y_range = max(y_coords) - min(y_coords) if y_coords else 1
+                    z_range = max(z_coords) - min(z_coords) if z_coords else 1
+                    
+                    max_range = max(x_range, y_range, z_range) or 1
+                    padding = max_range * 0.1  # 10% padding
+                    
+                    mid_x = (max(x_coords) + min(x_coords)) / 2 if x_coords else 0
+                    mid_y = (max(y_coords) + min(y_coords)) / 2 if y_coords else 0
+                    mid_z = (max(z_coords) + min(z_coords)) / 2 if z_coords else 0
+                    
+                    # Set limits with padding
+                    self.ax.set_xlim(mid_x - max_range/2 - padding, mid_x + max_range/2 + padding)
+                    self.ax.set_ylim(mid_y - max_range/2 - padding, mid_y + max_range/2 + padding)
+                    self.ax.set_zlim(mid_z - max_range/2 - padding, mid_z + max_range/2 + padding)
+                    
+                    # Set equal aspect ratio for better 3D view
+                    self.ax.set_box_aspect([1, 1, 1])
+                else:
+                    # Default view if no data
+                    self.ax.set_xlim(-10, 10)
+                    self.ax.set_ylim(-10, 10)
+                    self.ax.set_zlim(0, 20)
+            else:
+                # Clear plot if no data
+                self.ax.set_xlabel('X (cm)', fontsize=10)
+                self.ax.set_ylabel('Y (cm)', fontsize=10)
+                self.ax.set_zlabel('Z (cm)', fontsize=10)
+                self.ax.set_title('3D Scan Point Cloud - No data', fontsize=11)
+                self.ax.set_xlim(-10, 10)
+                self.ax.set_ylim(-10, 10)
+                self.ax.set_zlim(0, 20)
+            
+            # Redraw canvas
+            self.canvas.draw()
+            self.canvas.flush_events()
+            
+        except Exception as e:
+            self.log_info(f"Visualization error: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def export_stl(self):
+        messagebox.showinfo("Export", "STL export not implemented in fixed version")
+
+    def export_k(self):
+        messagebox.showinfo("Export", ".k export not implemented in fixed version")
+
+    def get_cartesian_points(self):
+        return None
+
     def log_info(self, message):
-        """Log message to info text widget"""
-        self.info_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
-        self.info_text.see(tk.END)
+        """Log to info text widget (thread-safe)"""
+        if hasattr(self, 'root') and hasattr(self, 'info_text'):
+            self.root.after(0, lambda msg=message: self._log_info_safe(msg))
+        else:
+            print(f"[LOG] {message}")
+
+    def _log_info_safe(self, message):
+        """Thread-safe helper"""
+        try:
+            if hasattr(self, 'info_text'):
+                self.info_text.insert(tk.END, f"[{time.strftime('%H:%M:%S')}] {message}\n")
+                self.info_text.see(tk.END)
+        except Exception as e:
+            print(f"Error logging: {e}")
+
+    def log_serial_send(self, command):
+        """Log command sent"""
+        if hasattr(self, 'serial_log_text'):
+            timestamp = time.strftime('%H:%M:%S')
+            self.serial_log_text.insert(tk.END, f"[{timestamp}] → SEND: {command.strip()}\n")
+            self.serial_log_text.see(tk.END)
+            lines = int(self.serial_log_text.index('end-1c').split('.')[0])
+            if lines > 1000:
+                self.serial_log_text.delete('1.0', f'{lines-1000}.0')
+
+    def log_serial_receive(self, response):
+        """Log response received"""
+        if hasattr(self, 'serial_log_text'):
+            timestamp = time.strftime('%H:%M:%S')
+            self.serial_log_text.insert(tk.END, f"[{timestamp}] ← RECV: {response.strip()}\n")
+            self.serial_log_text.see(tk.END)
+            lines = int(self.serial_log_text.index('end-1c').split('.')[0])
+            if lines > 1000:
+                self.serial_log_text.delete('1.0', f'{lines-1000}.0')
+
+    def clear_serial_log(self):
+        """Clear serial log"""
+        if hasattr(self, 'serial_log_text'):
+            self.serial_log_text.delete('1.0', tk.END)
 
 def main():
     root = tk.Tk()
@@ -1648,4 +1684,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

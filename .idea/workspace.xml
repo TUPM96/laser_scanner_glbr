@@ -5,9 +5,18 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="c62136b7-a7ec-4de2-a6c8-6926338db95d" name="Changes" comment="">
+      <change beforePath="$PROJECT_DIR$/.idea/misc.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/misc.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/firmware/platformio.ini" beforeDir="false" afterPath="$PROJECT_DIR$/firmware/platformio.ini" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/firmware/src/main.cpp" beforeDir="false" afterPath="$PROJECT_DIR$/firmware/src/main.cpp" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/farmer.TXT" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/firmware/firmware/.gitignore" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/firmware/firmware/.vscode/extensions.json" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/firmware/firmware/README.md" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/firmware/firmware/platformio.ini" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/firmware/firmware/src/main.cpp" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scannerCode.ino" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/scanner_gui/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/scanner_gui/main.py" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/surf2stl.m" beforeDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -59,7 +68,10 @@
       <workItem from="1760527911162" duration="25626000" />
       <workItem from="1761239234041" duration="27000" />
       <workItem from="1763148276667" duration="5220000" />
-      <workItem from="1763450206759" duration="381000" />
+      <workItem from="1763450206759" duration="7404000" />
+      <workItem from="1763474787229" duration="787000" />
+      <workItem from="1763566781839" duration="1654000" />
+      <workItem from="1763732811695" duration="17660000" />
     </task>
     <servers />
   </component>
