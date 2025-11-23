@@ -852,8 +852,9 @@ class ScannerGUI:
             print(f"[PARSE] Step 11: Logging result...")
             result_msg = f"Angle={angle:.1f}°, Z={z_height_mm:.1f}mm"
             print(f"[RESULT] ✓ {result_msg}")
-            # Only log to GUI if significant change (reduce log spam during movement)
-            if not hasattr(self, '_last_logged_z') or abs(z_height_mm - self._last_logged_z) > 0.5:
+            # Only log to GUI if significant change (>=1.5mm, close to layer height of 2mm)
+            # This prevents spam during slow Z movement between layers
+            if not hasattr(self, '_last_logged_z') or abs(z_height_mm - self._last_logged_z) >= 1.5:
                 self.log_info(f"✓ Position: {result_msg}")
                 self._last_logged_z = z_height_mm
 
