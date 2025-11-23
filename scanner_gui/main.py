@@ -663,11 +663,11 @@ class ScannerGUI:
 
         # Log to GUI if needed
         if data_type == "position":
-            x_mm = parsed_data.get('x', 0)
-            z_mm = parsed_data.get('z', 0)  # Z height from GRBL Y (M8 leadscrew)
             angle = parsed_data.get('angle', 0)
-            print(f"[RESULT] Position → X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
-            self.log_info(f"✓ Position: X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
+            z_mm = parsed_data.get('z', 0)  # Z height (actual mm)
+            print(f"[RESULT] Position → Angle={angle:.1f}°, Z={z_mm:.1f}mm")
+            # This log is usually disabled by threshold check in parse_grbl_status
+            # Only shown here for debugging if called directly
 
     def process_serial_data(self, line):
         """Process incoming serial data from GRBL firmware"""
@@ -852,8 +852,9 @@ class ScannerGUI:
             print(f"[PARSE] Step 11: Logging result...")
             result_msg = f"Angle={angle:.1f}°, Z={z_height_mm:.1f}mm"
             print(f"[RESULT] ✓ {result_msg}")
-            # Only log to GUI if significant change (reduce log spam during movement)
-            if not hasattr(self, '_last_logged_z') or abs(z_height_mm - self._last_logged_z) > 0.5:
+            # Only log to GUI if significant change (>=1.5mm, close to layer height of 2mm)
+            # This prevents spam during slow Z movement between layers
+            if not hasattr(self, '_last_logged_z') or abs(z_height_mm - self._last_logged_z) >= 1.5:
                 self.log_info(f"✓ Position: {result_msg}")
                 self._last_logged_z = z_height_mm
 
@@ -1276,19 +1277,19 @@ class ScannerGUI:
         angle_deg: rotation angle in degrees
         distance_mm: distance from sensor in mm
         z_height_mm: height in mm
-        Returns: (x, y, z) in cm or None if filtered out
+        Returns: (x, y, z) in mm or None if filtered out
         """
         try:
             center_distance_cm = float(self.center_distance_var.get())
             disk_radius_cm = float(self.disk_radius_var.get())
-            
-            # Convert distance from mm to cm
+
+            # Convert distance from mm to cm for calculation
             distance_cm = distance_mm / 10.0
-            
+
             # Filter 1: Remove negative or zero distances (error readings)
             if distance_cm <= 0:
                 return None
-            
+
             # Filter 2: Calculate valid range
             # Cảm biến ở bên cạnh, cách tâm center_distance_cm
             # Bán kính đĩa disk_radius_cm
@@ -1296,33 +1297,36 @@ class ScannerGUI:
             # Khoảng cách tối đa: center + radius = 15 + 5 = 20cm
             min_distance_cm = center_distance_cm - disk_radius_cm  # 10cm
             max_distance_cm = center_distance_cm + disk_radius_cm  # 20cm
-            
+
             # Filter 3: Remove values outside valid range
             if distance_cm < min_distance_cm or distance_cm > max_distance_cm:
                 return None  # Out of range, skip this point
-            
+
             # Calculate radius from center
             # Logic from MATLAB: r = centerDistance - distance
             # This gives radius from turntable center to object surface
             radius_from_center = center_distance_cm - distance_cm
-            
+
             # Filter 4: Remove values around 0 (midThresh in MATLAB)
             # midThreshUpper=0.5, midThreshLower=-0.5
             mid_thresh_upper = 0.5
             mid_thresh_lower = -0.5
             if mid_thresh_lower < radius_from_center < mid_thresh_upper:
                 return None  # Too close to center, likely error
-            
+
             # Convert angle to radians
             angle_rad = np.radians(angle_deg)
-            
-            # Calculate x, y in cm (cylindrical coordinates)
+
+            # Calculate x, y in cm (cylindrical coordinates), then convert to mm
             x_cm = radius_from_center * np.cos(angle_rad)
             y_cm = radius_from_center * np.sin(angle_rad)
-            # Z height: convert mm to cm (zDelta in MATLAB is 0.1 cm per layer)
-            z_cm = z_height_mm / 10.0
-            
-            return (x_cm, y_cm, z_cm)
+            x_mm = x_cm * 10.0  # Convert cm to mm for display
+            y_mm = y_cm * 10.0  # Convert cm to mm for display
+
+            # Z height: keep in mm (no conversion needed)
+            z_mm = z_height_mm
+
+            return (x_mm, y_mm, z_mm)
         except Exception as e:
             self.log_info(f"Error calculating point: {e}")
             return None
@@ -1342,7 +1346,7 @@ class ScannerGUI:
             self.scan_data.append(point)
             # Update visualization in main thread (thread-safe)
             self.root.after(0, self.update_visualization)
-            self.log_info(f"Point added: angle={angle:.1f}°, dist={self.current_vl53_distance:.1f}mm, z={z_height:.2f}mm, point=({point[0]:.2f}, {point[1]:.2f}, {point[2]:.2f})")
+            self.log_info(f"Point added: angle={angle:.1f}°, dist={self.current_vl53_distance:.1f}mm, z={z_height:.1f}mm, point=({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})mm")
 
     def scan_rotation_loop(self):
         """Main scan loop: rotate X continuously, read sensor, move Z up after each rotation"""
@@ -1657,9 +1661,9 @@ class ScannerGUI:
                                        c='blue', s=3, alpha=0.9, edgecolors='none')
                 
                 # Set labels
-                self.ax.set_xlabel('X (cm)', fontsize=10)
-                self.ax.set_ylabel('Y (cm)', fontsize=10)
-                self.ax.set_zlabel('Z (cm)', fontsize=10)
+                self.ax.set_xlabel('X (mm)', fontsize=10)
+                self.ax.set_ylabel('Y (mm)', fontsize=10)
+                self.ax.set_zlabel('Z (mm)', fontsize=10)
                 self.ax.set_title(f'3D Scan Point Cloud - {len(self.scan_data)} points', fontsize=11, fontweight='bold')
                 
                 # Calculate bounds with some padding
