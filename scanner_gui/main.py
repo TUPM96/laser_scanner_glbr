@@ -1458,35 +1458,33 @@ class ScannerGUI:
                             target_reached = True
                     
                     if target_reached:
-                        # Request sensor reading with timeout
+                        # Request sensor reading - WAIT until data received (no timeout)
                         sensor_data_received = False
-                        try:
-                            if self.serial_conn:
-                                self.send_serial_command("READ_VL53L0X\n", log=False)
 
-                            # Wait for sensor reading with timeout (max 0.5s)
-                            wait_start = time.time()
-                            while time.time() - wait_start < 0.5:
-                                if self.current_vl53_distance is not None:
-                                    sensor_data_received = True
-                                    break
-                                time.sleep(0.05)
+                        # Keep trying until we get sensor data
+                        while not sensor_data_received:
+                            try:
+                                if self.serial_conn:
+                                    self.send_serial_command("READ_VL53L0X\n", log=False)
 
-                            # Process point if we have sensor data
-                            if sensor_data_received:
-                                self.process_scan_data_point()
-                                points_collected += 1
-                            else:
-                                # Timeout - skip this point
-                                pass  # Silent skip, no log spam
-                        except Exception as e:
-                            # Handle write timeout or other errors gracefully
-                            if "timeout" in str(e).lower():
-                                pass  # Silent skip on timeout
-                            else:
-                                self.log_info(f"Sensor error at {current_angle:.1f}°: {e}")
+                                # Wait for sensor reading (max 0.5s per attempt)
+                                wait_start = time.time()
+                                while time.time() - wait_start < 0.5:
+                                    if self.current_vl53_distance is not None:
+                                        sensor_data_received = True
+                                        break
+                                    time.sleep(0.05)
 
-                        # Always move to next target angle (whether we got data or not)
+                                if not sensor_data_received:
+                                    time.sleep(0.1)  # Brief pause before retry
+
+                            except Exception as e:
+                                # Log error but keep trying
+                                time.sleep(0.1)
+
+                        # Process point and move to next angle (only after successful read)
+                        self.process_scan_data_point()
+                        points_collected += 1
                         last_processed_angle = current_angle
                         next_target_angle = (next_target_angle + angle_step) % 360.0
                         angle_changed = True
