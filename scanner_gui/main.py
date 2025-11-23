@@ -1414,32 +1414,33 @@ class ScannerGUI:
                         self.log_info(f"Collected all {points_per_rev} points")
                         break
                     
-                    # Check if we've completed a full rotation (360 degrees = 0.8mm)
-                    # Method 1: Check X position change (more reliable)
-                    current_x_pos = self.current_x_pos
-                    x_moved = abs(current_x_pos - start_x_pos)
-                    
-                    # X position wraps around: if start was near 0 and current is near 0.8, or vice versa
-                    # Or if we've moved approximately 0.8mm
-                    x_completed = (x_moved >= 0.75) or (start_x_pos < 0.1 and current_x_pos >= 0.75) or (start_x_pos >= 0.75 and current_x_pos < 0.1)
-                    
-                    # Method 2: Check angle difference (backup)
-                    angle_diff = current_angle - self.scan_start_angle
-                    if angle_diff < 0:
-                        angle_diff += 360.0
-                    
-                    # Also check if we've wrapped around (current angle near 0, start was near 360)
-                    wrapped_around = (self.scan_start_angle > 350.0 and current_angle < 10.0 and points_collected > 0)
-                    
-                    # Stop when X position indicates 1 full rotation OR angle indicates completion
-                    if x_completed or angle_diff >= 358.0 or (angle_diff >= 355.0 and points_collected >= points_per_rev * 0.9) or wrapped_around:
-                        if x_completed:
-                            self.log_info(f"Completed 1 full rotation (X moved {x_moved:.3f}mm: {start_x_pos:.3f} → {current_x_pos:.3f}mm)")
-                        elif wrapped_around:
-                            self.log_info(f"Completed 1 full rotation (wrapped around: {self.scan_start_angle:.1f}° → {current_angle:.1f}°)")
-                        else:
-                            self.log_info(f"Completed 1 full rotation ({angle_diff:.1f}°)")
-                        break
+                    # Check if we've completed a full rotation - ONLY after collecting all required points
+                    if points_collected >= points_per_rev:
+                        # Method 1: Check X position change (more reliable)
+                        current_x_pos = self.current_x_pos
+                        x_moved = abs(current_x_pos - start_x_pos)
+
+                        # X position wraps around: if start was near 0 and current is near 0.8, or vice versa
+                        # Or if we've moved approximately 0.8mm
+                        x_completed = (x_moved >= 0.70) or (start_x_pos < 0.1 and current_x_pos >= 0.70) or (start_x_pos >= 0.70 and current_x_pos < 0.1)
+
+                        # Method 2: Check angle difference (backup)
+                        angle_diff = current_angle - self.scan_start_angle
+                        if angle_diff < 0:
+                            angle_diff += 360.0
+
+                        # Also check if we've wrapped around (current angle near 0, start was near 360)
+                        wrapped_around = (self.scan_start_angle > 350.0 and current_angle < 10.0)
+
+                        # Stop when we've collected all points AND rotation is complete
+                        if x_completed or angle_diff >= 350.0 or wrapped_around:
+                            if x_completed:
+                                self.log_info(f"Completed 1 full rotation (X moved {x_moved:.3f}mm: {start_x_pos:.3f} → {current_x_pos:.3f}mm) - {points_collected}/{points_per_rev} points")
+                            elif wrapped_around:
+                                self.log_info(f"Completed 1 full rotation (wrapped around: {self.scan_start_angle:.1f}° → {current_angle:.1f}°) - {points_collected}/{points_per_rev} points")
+                            else:
+                                self.log_info(f"Completed 1 full rotation ({angle_diff:.1f}°) - {points_collected}/{points_per_rev} points")
+                            break
                     
                     # Calculate angle change from last processed angle
                     angle_change = (current_angle - last_processed_angle) % 360.0
