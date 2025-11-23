@@ -663,11 +663,11 @@ class ScannerGUI:
 
         # Log to GUI if needed
         if data_type == "position":
-            x_mm = parsed_data.get('x', 0)
-            z_mm = parsed_data.get('z', 0)  # Z height from GRBL Y (M8 leadscrew)
             angle = parsed_data.get('angle', 0)
-            print(f"[RESULT] Position → X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
-            self.log_info(f"✓ Position: X={x_mm:.3f}mm ({angle:.1f}°), Z={z_mm:.3f}mm")
+            z_mm = parsed_data.get('z', 0)  # Z height (actual mm)
+            print(f"[RESULT] Position → Angle={angle:.1f}°, Z={z_mm:.1f}mm")
+            # This log is usually disabled by threshold check in parse_grbl_status
+            # Only shown here for debugging if called directly
 
     def process_serial_data(self, line):
         """Process incoming serial data from GRBL firmware"""
