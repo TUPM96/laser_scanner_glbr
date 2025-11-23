@@ -848,11 +848,14 @@ class ScannerGUI:
             z_height_mm = y_mm
             print(f"[PARSE] Step 10: Z height = {z_height_mm:.1f}mm (actual measurement)")
 
-            # Step 11: Log result
+            # Step 11: Log result (simplified - only angle for X)
             print(f"[PARSE] Step 11: Logging result...")
-            result_msg = f"X={x_mm:.3f}mm ({angle:.1f}°), Z={z_height_mm:.3f}mm"
+            result_msg = f"Angle={angle:.1f}°, Z={z_height_mm:.1f}mm"
             print(f"[RESULT] ✓ {result_msg}")
-            self.log_info(f"✓ Position: {result_msg}")
+            # Only log to GUI if significant change (reduce log spam during movement)
+            if not hasattr(self, '_last_logged_z') or abs(z_height_mm - self._last_logged_z) > 0.5:
+                self.log_info(f"✓ Position: {result_msg}")
+                self._last_logged_z = z_height_mm
 
             # Step 12: Update GUI
             print(f"[PARSE] Step 12: Updating GUI display...")
@@ -1586,34 +1589,72 @@ class ScannerGUI:
         self.log_info("Send config not implemented")
 
     def update_visualization(self):
-        """Update 3D visualization with scan data"""
+        """Update 3D visualization with scan data - surface mesh + point cloud"""
         try:
             self.ax.clear()
-            
+
             if len(self.scan_data) > 0:
                 # Extract x, y, z coordinates
-                x_coords = [p[0] for p in self.scan_data]
-                y_coords = [p[1] for p in self.scan_data]
-                z_coords = [p[2] for p in self.scan_data]
-                
-                # Color points by Z height for better 3D visualization
-                if z_coords:
+                x_coords = np.array([p[0] for p in self.scan_data])
+                y_coords = np.array([p[1] for p in self.scan_data])
+                z_coords = np.array([p[2] for p in self.scan_data])
+
+                # Try to create surface mesh if we have enough structured data
+                try:
+                    # Get unique Z heights (layers)
+                    unique_z = np.unique(z_coords)
+                    if len(unique_z) >= 2:  # Need at least 2 layers for surface
+                        # Group points by layer
+                        layers = []
+                        for z_val in unique_z:
+                            layer_mask = np.abs(z_coords - z_val) < 0.01  # tolerance 0.01cm
+                            layer_x = x_coords[layer_mask]
+                            layer_y = y_coords[layer_mask]
+                            if len(layer_x) > 0:
+                                layers.append((layer_x, layer_y, z_val))
+
+                        # Draw surface between consecutive layers
+                        if len(layers) >= 2:
+                            for i in range(len(layers) - 1):
+                                x1, y1, z1 = layers[i]
+                                x2, y2, z2 = layers[i + 1]
+
+                                # Create mesh between two layers
+                                n_points = min(len(x1), len(x2))
+                                if n_points >= 3:
+                                    # Draw surface strips
+                                    for j in range(n_points - 1):
+                                        # Create quad between points
+                                        verts = [
+                                            [x1[j], y1[j], z1],
+                                            [x1[j+1], y1[j+1], z1],
+                                            [x2[j+1], y2[j+1], z2],
+                                            [x2[j], y2[j], z2]
+                                        ]
+                                        # Draw filled polygon
+                                        self.ax.plot([v[0] for v in verts] + [verts[0][0]],
+                                                    [v[1] for v in verts] + [verts[0][1]],
+                                                    [v[2] for v in verts] + [verts[0][2]],
+                                                    'b-', alpha=0.3, linewidth=0.5)
+                except Exception as e:
+                    # If surface creation fails, continue with point cloud
+                    print(f"[VIZ] Surface mesh failed: {e}, using point cloud only")
+
+                # Always draw point cloud on top
+                if len(z_coords) > 0:
                     min_z = min(z_coords)
                     max_z = max(z_coords)
                     if max_z > min_z:
                         # Normalize Z to 0-1 for colormap
                         z_normalized = [(z - min_z) / (max_z - min_z) for z in z_coords]
                         # Use colormap: blue (low) to red (high)
-                        colors = self.ax.scatter(x_coords, y_coords, z_coords, 
-                                                c=z_normalized, cmap='viridis', 
-                                                s=5, alpha=0.8, edgecolors='none')
+                        self.ax.scatter(x_coords, y_coords, z_coords,
+                                       c=z_normalized, cmap='viridis',
+                                       s=3, alpha=0.9, edgecolors='none')
                     else:
                         # All points at same height
-                        self.ax.scatter(x_coords, y_coords, z_coords, 
-                                       c='blue', s=5, alpha=0.8, edgecolors='none')
-                else:
-                    self.ax.scatter(x_coords, y_coords, z_coords, 
-                                   c='blue', s=5, alpha=0.8, edgecolors='none')
+                        self.ax.scatter(x_coords, y_coords, z_coords,
+                                       c='blue', s=3, alpha=0.9, edgecolors='none')
                 
                 # Set labels
                 self.ax.set_xlabel('X (cm)', fontsize=10)
