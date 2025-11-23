@@ -1633,35 +1633,43 @@ class ScannerGUI:
                         # Group points by layer
                         layers = []
                         for z_val in unique_z:
-                            layer_mask = np.abs(z_coords - z_val) < 0.01  # tolerance 0.01cm
+                            layer_mask = np.abs(z_coords - z_val) < 0.01  # tolerance 0.01mm
                             layer_x = x_coords[layer_mask]
                             layer_y = y_coords[layer_mask]
                             if len(layer_x) > 0:
                                 layers.append((layer_x, layer_y, z_val))
 
-                        # Draw surface between consecutive layers
+                        # Draw vertical mesh connecting layers (skip empty intermediate layers)
+                        # User request: Connect layer to next non-empty layer, no within-layer circles
                         if len(layers) >= 2:
-                            for i in range(len(layers) - 1):
+                            for i in range(len(layers)):
                                 x1, y1, z1 = layers[i]
-                                x2, y2, z2 = layers[i + 1]
 
-                                # Create mesh between two layers
-                                n_points = min(len(x1), len(x2))
-                                if n_points >= 3:
-                                    # Draw surface strips
-                                    for j in range(n_points - 1):
-                                        # Create quad between points
-                                        verts = [
-                                            [x1[j], y1[j], z1],
-                                            [x1[j+1], y1[j+1], z1],
-                                            [x2[j+1], y2[j+1], z2],
-                                            [x2[j], y2[j], z2]
-                                        ]
-                                        # Draw filled polygon
-                                        self.ax.plot([v[0] for v in verts] + [verts[0][0]],
-                                                    [v[1] for v in verts] + [verts[0][1]],
-                                                    [v[2] for v in verts] + [verts[0][2]],
-                                                    'b-', alpha=0.3, linewidth=0.5)
+                                # Find next non-empty layer (could be i+1, i+2, i+3, etc.)
+                                for j in range(i + 1, len(layers)):
+                                    x2, y2, z2 = layers[j]
+
+                                    # Create vertical mesh strips between corresponding points
+                                    n_points = min(len(x1), len(x2))
+                                    if n_points >= 2:
+                                        # Draw vertical quads between corresponding points
+                                        for k in range(n_points - 1):
+                                            # Create quad with vertical connections only
+                                            # Connect point k and k+1 across two layers
+                                            verts = [
+                                                [x1[k], y1[k], z1],        # Point k in layer i
+                                                [x2[k], y2[k], z2],        # Point k in layer j (vertical edge)
+                                                [x2[k+1], y2[k+1], z2],    # Point k+1 in layer j
+                                                [x1[k+1], y1[k+1], z1]     # Point k+1 in layer i (vertical edge)
+                                            ]
+                                            # Draw filled polygon (creates vertical strips, no circles within layers)
+                                            self.ax.plot([v[0] for v in verts] + [verts[0][0]],
+                                                        [v[1] for v in verts] + [verts[0][1]],
+                                                        [v[2] for v in verts] + [verts[0][2]],
+                                                        'b-', alpha=0.3, linewidth=0.5)
+
+                                    # Only connect to first non-empty layer found
+                                    break
                 except Exception as e:
                     # If surface creation fails, continue with point cloud
                     print(f"[VIZ] Surface mesh failed: {e}, using point cloud only")
