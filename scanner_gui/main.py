@@ -1383,122 +1383,100 @@ class ScannerGUI:
             # Speed for scan is always 1 (slowest speed for step motor)
             speed = 1.0
             
-            self.log_info(f"Scan settings: {points_per_rev} points/vòng, {angle_step:.2f}° per point, speed=F{int(speed)}")
-            
+            # Calculate step distance in mm for each angle increment
+            # angle_step degrees = one_rev_distance * (angle_step / 360.0)
+            step_distance_mm = one_rev_distance * (angle_step / 360.0)
+
+            self.log_info(f"Scan settings: {points_per_rev} points/vòng, {angle_step:.2f}° per point ({step_distance_mm:.3f}mm per step), speed=F{int(speed)}")
+
             while self.is_scanning and not self.scan_paused:
-                # Record starting angle and X position
-                self.scan_start_angle = self.current_angle
-                start_x_pos = self.current_x_pos  # X position in mm (rotation axis)
+                # Record starting position
                 start_z = self.current_y_pos
-                
-                self.log_info(f"Starting rotation at angle {self.scan_start_angle:.1f}°, X={start_x_pos:.3f}mm, Z={start_z:.2f}mm")
-                
-                # Start continuous rotation (1 full revolution = 0.8mm)
-                commands = self.format_gcode_command(x_move=one_rev_distance, feed_rate=speed)
-                self.send_gcode_commands(commands, delay=0.05)
-                
-                # Monitor rotation and collect data points
-                last_angle = self.current_angle
-                last_processed_angle = self.scan_start_angle
-                angle_changed = False
+
+                self.log_info(f"=== Starting layer at Z={start_z:.2f}mm ===")
+
+                # Step-by-step rotation: Move to each angle, STOP, read sensor, then continue
                 points_collected = 0
-                next_target_angle = (self.scan_start_angle + angle_step) % 360.0
-                
-                # Wait for rotation to complete (monitor angle change)
-                timeout = time.time() + 60  # 60 second timeout (slower speed needs more time)
-                while self.is_scanning and not self.scan_paused:
-                    current_angle = self.current_angle
-                    
-                    # Check if we've collected enough points
-                    if points_collected >= points_per_rev:
-                        self.log_info(f"Collected all {points_per_rev} points")
+
+                for point_num in range(points_per_rev):
+                    if not self.is_scanning or self.scan_paused:
                         break
-                    
-                    # Check if we've completed a full rotation - ONLY after collecting all required points
-                    if points_collected >= points_per_rev:
-                        # Method 1: Check X position change (more reliable)
-                        current_x_pos = self.current_x_pos
-                        x_moved = abs(current_x_pos - start_x_pos)
 
-                        # X position wraps around: if start was near 0 and current is near 0.8, or vice versa
-                        # Or if we've moved approximately 0.8mm
-                        x_completed = (x_moved >= 0.70) or (start_x_pos < 0.1 and current_x_pos >= 0.70) or (start_x_pos >= 0.70 and current_x_pos < 0.1)
+                    # Step 1: Send command to rotate one step (e.g., 45° = 0.1mm)
+                    current_angle_before = self.current_angle
+                    self.log_info(f"Point {point_num + 1}/{points_per_rev}: Rotating {angle_step:.1f}° from {current_angle_before:.1f}°")
 
-                        # Method 2: Check angle difference (backup)
-                        angle_diff = current_angle - self.scan_start_angle
-                        if angle_diff < 0:
-                            angle_diff += 360.0
+                    # Send movement command (x_move for rotation axis)
+                    # Note: format_gcode_command maps x_move to GRBL Y (rotation)
+                    move_commands = self.format_gcode_command(x_move=step_distance_mm, feed_rate=speed)
+                    if self.serial_conn:
+                        self.send_gcode_commands(move_commands, delay=0.1)
 
-                        # Also check if we've wrapped around (current angle near 0, start was near 360)
-                        wrapped_around = (self.scan_start_angle > 350.0 and current_angle < 10.0)
+                    # Step 2: Wait for motor to complete movement (motor STOPS at target)
+                    # Wait at least 0.5s for movement to complete
+                    time.sleep(0.5)
 
-                        # Stop when we've collected all points AND rotation is complete
-                        if x_completed or angle_diff >= 350.0 or wrapped_around:
-                            if x_completed:
-                                self.log_info(f"Completed 1 full rotation (X moved {x_moved:.3f}mm: {start_x_pos:.3f} → {current_x_pos:.3f}mm) - {points_collected}/{points_per_rev} points")
-                            elif wrapped_around:
-                                self.log_info(f"Completed 1 full rotation (wrapped around: {self.scan_start_angle:.1f}° → {current_angle:.1f}°) - {points_collected}/{points_per_rev} points")
-                            else:
-                                self.log_info(f"Completed 1 full rotation ({angle_diff:.1f}°) - {points_collected}/{points_per_rev} points")
+                    # Verify angle has changed
+                    movement_timeout = time.time() + 5.0  # Max 5s for movement
+                    angle_moved = False
+                    while time.time() < movement_timeout:
+                        current_angle_after = self.current_angle
+                        angle_diff = abs(current_angle_after - current_angle_before)
+                        if angle_diff > 180:
+                            angle_diff = 360 - angle_diff
+
+                        if angle_diff >= angle_step * 0.3:  # At least 30% of expected movement
+                            angle_moved = True
                             break
-                    
-                    # Calculate angle change from last processed angle
-                    angle_change = (current_angle - last_processed_angle) % 360.0
-                    if angle_change > 180:
-                        angle_change = 360 - angle_change
-                    
-                    # Check if we've reached the next target angle
-                    target_reached = False
-                    if angle_change >= angle_step * 0.8:  # 80% of step to account for timing
-                        # Check if we're close to target angle
-                        angle_to_target = (next_target_angle - current_angle) % 360.0
-                        if angle_to_target > 180:
-                            angle_to_target = 360 - angle_to_target
-                        
-                        if angle_to_target <= angle_step * 0.5 or angle_change >= angle_step:
-                            target_reached = True
-                    
-                    if target_reached:
-                        # Request sensor reading - WAIT until data received (no timeout)
-                        sensor_data_received = False
+                        time.sleep(0.1)
 
-                        # Keep trying until we get sensor data
-                        while not sensor_data_received:
-                            try:
-                                if self.serial_conn:
-                                    self.send_serial_command("READ_VL53L0X\n", log=False)
+                    if not angle_moved:
+                        self.log_info(f"⚠ Warning: Angle did not change significantly after movement command")
 
-                                # Wait for sensor reading (max 0.5s per attempt)
-                                wait_start = time.time()
-                                while time.time() - wait_start < 0.5:
-                                    if self.current_vl53_distance is not None:
-                                        sensor_data_received = True
-                                        break
-                                    time.sleep(0.05)
+                    # Step 3: Motor is now STOPPED - Read sensor (MUST succeed before continuing)
+                    sensor_data_received = False
+                    retry_count = 0
 
-                                if not sensor_data_received:
-                                    time.sleep(0.1)  # Brief pause before retry
+                    while not sensor_data_received:
+                        if not self.is_scanning or self.scan_paused:
+                            break
 
-                            except Exception as e:
-                                # Log error but keep trying
+                        try:
+                            if self.serial_conn:
+                                self.send_serial_command("READ_VL53L0X\n", log=False)
+
+                            # Wait for sensor reading (max 0.5s per attempt)
+                            wait_start = time.time()
+                            while time.time() - wait_start < 0.5:
+                                if self.current_vl53_distance is not None:
+                                    sensor_data_received = True
+                                    break
+                                time.sleep(0.05)
+
+                            if not sensor_data_received:
+                                retry_count += 1
+                                if retry_count % 5 == 0:  # Log every 5 retries
+                                    self.log_info(f"Waiting for sensor reading at {self.current_angle:.1f}° (attempt {retry_count})...")
                                 time.sleep(0.1)
 
-                        # Process point and move to next angle (only after successful read)
+                        except Exception as e:
+                            retry_count += 1
+                            if retry_count % 10 == 0:
+                                self.log_info(f"Sensor error at {self.current_angle:.1f}°: {e}")
+                            time.sleep(0.1)
+
+                    if not self.is_scanning or self.scan_paused:
+                        break
+
+                    # Step 4: Process and draw point (MUST succeed before continuing)
+                    try:
                         self.process_scan_data_point()
                         points_collected += 1
-                        last_processed_angle = current_angle
-                        next_target_angle = (next_target_angle + angle_step) % 360.0
-                        angle_changed = True
-                    
-                    if abs(current_angle - last_angle) > 0.1:  # Angle is changing
-                        angle_changed = True
-                    last_angle = current_angle
-                    
-                    if time.time() > timeout:
-                        self.log_info(f"Rotation timeout. Collected {points_collected}/{points_per_rev} points")
-                        break
-                    
-                    time.sleep(0.05)  # Check every 50ms
+                        # Point successfully processed, continue to next
+                    except Exception as e:
+                        self.log_info(f"Error processing point {point_num + 1}: {e}")
+                        # Still increment to avoid infinite loop
+                        points_collected += 1
                 
                 self.log_info(f"Rotation complete. Collected {points_collected}/{points_per_rev} points")
                 
