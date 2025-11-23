@@ -1689,17 +1689,17 @@ class ScannerGUI:
                 self.ax.set_title(f'3D Scan Point Cloud - {len(self.scan_data)} points', fontsize=11, fontweight='bold')
                 
                 # Calculate bounds with some padding
-                if x_coords and y_coords and z_coords:
-                    x_range = max(x_coords) - min(x_coords) if x_coords else 1
-                    y_range = max(y_coords) - min(y_coords) if y_coords else 1
-                    z_range = max(z_coords) - min(z_coords) if z_coords else 1
-                    
+                if len(x_coords) > 0 and len(y_coords) > 0 and len(z_coords) > 0:
+                    x_range = max(x_coords) - min(x_coords)
+                    y_range = max(y_coords) - min(y_coords)
+                    z_range = max(z_coords) - min(z_coords)
+
                     max_range = max(x_range, y_range, z_range) or 1
                     padding = max_range * 0.1  # 10% padding
-                    
-                    mid_x = (max(x_coords) + min(x_coords)) / 2 if x_coords else 0
-                    mid_y = (max(y_coords) + min(y_coords)) / 2 if y_coords else 0
-                    mid_z = (max(z_coords) + min(z_coords)) / 2 if z_coords else 0
+
+                    mid_x = (max(x_coords) + min(x_coords)) / 2
+                    mid_y = (max(y_coords) + min(y_coords)) / 2
+                    mid_z = (max(z_coords) + min(z_coords)) / 2
                     
                     # Set limits with padding
                     self.ax.set_xlim(mid_x - max_range/2 - padding, mid_x + max_range/2 + padding)
