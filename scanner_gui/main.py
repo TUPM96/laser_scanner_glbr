@@ -1434,21 +1434,23 @@ class ScannerGUI:
                         self.log_info(f"⚠ Warning: Angle did not change significantly after movement command")
 
                     # Step 3: Motor is now STOPPED - Read sensor (MUST succeed before continuing)
+                    # CRITICAL: Clear old sensor data to ensure we get FRESH reading
+                    self.current_vl53_distance = None
                     sensor_data_received = False
                     retry_count = 0
 
+                    # WAIT indefinitely until we get valid sensor data
+                    # Do NOT break out of this loop until we have data
                     while not sensor_data_received:
-                        if not self.is_scanning or self.scan_paused:
-                            break
-
                         try:
                             if self.serial_conn:
                                 self.send_serial_command("READ_VL53L0X\n", log=False)
 
-                            # Wait for sensor reading (max 0.5s per attempt)
+                            # Wait for NEW sensor reading (max 0.5s per attempt)
                             wait_start = time.time()
                             while time.time() - wait_start < 0.5:
                                 if self.current_vl53_distance is not None:
+                                    # Got fresh data!
                                     sensor_data_received = True
                                     break
                                 time.sleep(0.05)
@@ -1456,27 +1458,19 @@ class ScannerGUI:
                             if not sensor_data_received:
                                 retry_count += 1
                                 if retry_count % 5 == 0:  # Log every 5 retries
-                                    self.log_info(f"Waiting for sensor reading at {self.current_angle:.1f}° (attempt {retry_count})...")
+                                    self.log_info(f"⏳ Waiting for sensor at angle {self.current_angle:.1f}° (attempt {retry_count})...")
                                 time.sleep(0.1)
 
                         except Exception as e:
                             retry_count += 1
                             if retry_count % 10 == 0:
-                                self.log_info(f"Sensor error at {self.current_angle:.1f}°: {e}")
+                                self.log_info(f"⚠ Sensor error at {self.current_angle:.1f}°: {e} - retrying...")
                             time.sleep(0.1)
 
-                    if not self.is_scanning or self.scan_paused:
-                        break
-
-                    # Step 4: Process and draw point (MUST succeed before continuing)
-                    try:
-                        self.process_scan_data_point()
-                        points_collected += 1
-                        # Point successfully processed, continue to next
-                    except Exception as e:
-                        self.log_info(f"Error processing point {point_num + 1}: {e}")
-                        # Still increment to avoid infinite loop
-                        points_collected += 1
+                    # Step 4: Process and draw point (we have valid data now)
+                    self.process_scan_data_point()
+                    points_collected += 1
+                    self.log_info(f"✓ Point {points_collected}/{points_per_rev} at {self.current_angle:.1f}° - Distance: {self.current_vl53_distance}mm")
                 
                 self.log_info(f"Rotation complete. Collected {points_collected}/{points_per_rev} points")
                 
