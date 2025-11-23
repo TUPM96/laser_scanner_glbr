@@ -2,11 +2,24 @@
 3D Scanner GUI Application
 Python GUI for controlling 3D scanner and visualizing scan data
 
-CORRECTED VERSION - HARDWARE SPECIFICATIONS:
-- Rotation (X axis): 0.1mm = 45 degrees, angle = position_mm × 450
-- Height (Z axis, mapped from GRBL X): M8 lead screw, 1 revolution = 8mm
-- Mapping: GRBL X -> GUI Z (height in mm), GRBL Y -> GUI X (rotation angle)
-- NOTE: format_gcode_command swaps X/Y when sending, so parse_grbl_status swaps back when reading
+CORRECTED VERSION - HARDWARE SPECIFICATIONS & CALIBRATION:
+
+ROTATION AXIS (GUI X = GRBL Y):
+- Calibration: 0.1mm GRBL = 45° motor rotation
+- Formula: angle = GRBL_Y_position × 450
+- Full rotation: 360° = 0.8mm GRBL units
+- Conversion: Direct value (no scaling needed)
+
+HEIGHT AXIS (GUI Z = GRBL X):
+- Full step mode: G1 X0.1 = 45° motor = 1mm actual movement
+- M8 lead screw: 1 motor revolution (360°) = 8mm
+- Formula: actual_mm = GRBL_X_value × 10
+- Conversion when sending: GRBL_X = mm / 10
+- Conversion when parsing: mm = GRBL_X × 10
+
+COORDINATE MAPPING:
+- format_gcode_command(): GUI X → GRBL Y (direct), GUI Z → GRBL X (÷10)
+- parse_grbl_status(): GRBL Y → GUI X (direct), GRBL X → GUI Z (×10)
 """
 
 import tkinter as tk
@@ -43,11 +56,12 @@ class ScannerGUI:
         self.scan_start_angle = 0.0  # Starting angle for current rotation
 
         # Position tracking - CORRECTED CALIBRATION
-        # Rotation axis (GRBL Y -> GUI X): 0.1mm = 45 degrees, angle = position_mm × 450
-        # Height axis (GRBL X -> GUI Z): M8 lead screw, 1 revolution = 8mm, GRBL reports in mm
-        # NOTE: format_gcode_command swaps X/Y when sending, so parse_grbl_status swaps back
-        self.current_x_pos = 0.0  # Rotation position in mm (from GRBL Y after swap)
-        self.current_y_pos = 0.0  # Height position in mm (from GRBL X after swap, mapped to Z in GUI)
+        # Rotation axis (GRBL Y → GUI X): 0.1mm GRBL = 45°, direct value
+        # Height axis (GRBL X → GUI Z): Full step mode, GRBL value × 10 = actual mm
+        # NOTE: format_gcode_command swaps X/Y and scales Z when sending
+        #       parse_grbl_status swaps back and scales Z × 10 when parsing
+        self.current_x_pos = 0.0  # Rotation position in mm (from GRBL Y, direct value)
+        self.current_y_pos = 0.0  # Height position in mm (from GRBL X × 10, actual measurement)
         self.current_z_pos = 0.0  # GRBL Z position in mm (unused)
         self.grbl_state = "Idle"  # GRBL state
 
@@ -119,6 +133,10 @@ class ScannerGUI:
         ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
         self.points_per_revolution_var = tk.StringVar(value="360")
         ttk.Entry(geometry_frame, textvariable=self.points_per_revolution_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=2)
+
+        ttk.Label(geometry_frame, text="Chiều cao tối đa (mm):").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=1)
+        self.z_travel_var = tk.StringVar(value="100")
+        ttk.Entry(geometry_frame, textvariable=self.z_travel_var, width=8).grid(row=1, column=3, sticky=tk.W, padx=2)
 
         # Scan controls
         scan_frame = ttk.Frame(control_frame)
@@ -450,15 +468,20 @@ class ScannerGUI:
                 self.status_label.config(text="Status: Connected", foreground="green")
 
                 # ========================================
-                # STARTUP BANNER - Confirm correct version
+                # STARTUP BANNER - Display calibration info
                 # ========================================
                 self.log_info("=" * 60)
-                self.log_info("CORRECTED VERSION LOADED")
-                self.log_info("Rotation: 0.1mm = 45°, angle = position × 450")
-                self.log_info("Height: M8 lead screw, 1 rev = 8mm")
-                self.log_info("Mapping: GRBL X → GUI Z (height mm)")
-                self.log_info("         GRBL Y → GUI X (angle°)")
-                self.log_info("NOTE: X/Y swapped in commands, swapped back in parsing")
+                self.log_info("3D SCANNER - CALIBRATION INFO")
+                self.log_info("=" * 60)
+                self.log_info("ROTATION (GUI X = GRBL Y):")
+                self.log_info("  • 0.1mm GRBL = 45° motor")
+                self.log_info("  • angle = GRBL_Y × 450")
+                self.log_info("  • 1 full rotation = 0.8mm GRBL")
+                self.log_info("")
+                self.log_info("HEIGHT (GUI Z = GRBL X):")
+                self.log_info("  • Full step: G1 X0.1 = 45° = 1mm actual")
+                self.log_info("  • M8 lead screw: 1 rev = 8mm")
+                self.log_info("  • Conversion: mm = GRBL_X × 10")
                 self.log_info("=" * 60)
 
                 # Enable buttons
@@ -761,14 +784,14 @@ class ScannerGUI:
 
             # Step 6: Parse X and Y
             # NOTE: format_gcode_command swaps X and Y when sending:
-            #   GUI X (rotation) → sent as GRBL Y
-            #   GUI Y (height) → sent as GRBL X
+            #   GUI X (rotation) → sent as GRBL Y (direct value)
+            #   GUI Y (height) → sent as GRBL X (divided by 10)
             # So when parsing, we need to swap back:
-            #   positions[0] (GRBL X) = height (GUI Z)
-            #   positions[1] (GRBL Y) = rotation (GUI X)
+            #   positions[0] (GRBL X) = height units → multiply by 10 to get mm
+            #   positions[1] (GRBL Y) = rotation (direct mm value)
             print(f"[PARSE] Step 6: Parsing position values...")
             try:
-                # GRBL Y (positions[1]) is actually rotation (GUI X)
+                # GRBL Y (positions[1]) is rotation (GUI X) - direct value
                 x_mm = float(positions[1])
                 print(f"[PARSE] Step 6: X (rotation from GRBL Y) = {x_mm} mm")
             except ValueError as e:
@@ -777,9 +800,12 @@ class ScannerGUI:
                 return
 
             try:
-                # GRBL X (positions[0]) is actually height (GUI Z)
-                y_mm = float(positions[0])
-                print(f"[PARSE] Step 6: Y (height from GRBL X) = {y_mm} mm")
+                # GRBL X (positions[0]) is height (GUI Z) - need to multiply by 10
+                # Because: G1 X0.1 = 45° motor = 1mm actual movement
+                # Formula: mm_actual = GRBL_X_value × 10
+                y_grbl_units = float(positions[0])
+                y_mm = y_grbl_units * 10.0  # Convert GRBL units to actual mm
+                print(f"[PARSE] Step 6: Y (height from GRBL X) = {y_grbl_units} units = {y_mm:.1f} mm")
             except ValueError as e:
                 print(f"[PARSE] ✗ ERROR parsing Y from '{positions[0]}': {e}")
                 print(f"{'='*70}\n")
@@ -796,31 +822,31 @@ class ScannerGUI:
 
             # Step 7: Update internal state
             print(f"[PARSE] Step 7: Updating internal variables...")
-            self.current_x_pos = x_mm  # Rotation from GRBL Y
-            self.current_y_pos = y_mm  # Height from GRBL X (M8 lead screw, 1 revolution = 8mm)
+            self.current_x_pos = x_mm  # Rotation from GRBL Y (direct mm)
+            self.current_y_pos = y_mm  # Height from GRBL X (converted to actual mm)
             print(f"[PARSE] Step 7: ✓ Internal state updated")
-            print(f"[PARSE] Step 7: X = {x_mm}mm (rotation from GRBL Y), Y = {y_mm}mm (Z height from GRBL X, M8 leadscrew)")
+            print(f"[PARSE] Step 7: X = {x_mm:.3f}mm (rotation from GRBL Y), Y = {y_mm:.1f}mm (height from GRBL X)")
 
             # Step 8: Calculate angle from X position
             print(f"[PARSE] Step 8: Calculating angle from X position...")
-            print(f"[PARSE] Step 8: Formula: {x_mm} mm × 450 = ? degrees")
+            print(f"[PARSE] Step 8: Formula: {x_mm:.3f} mm × 450 = ? degrees")
             angle = x_mm * 450.0
-            print(f"[PARSE] Step 8: Raw angle = {angle}°")
+            print(f"[PARSE] Step 8: Raw angle = {angle:.1f}°")
 
             # Step 9: Normalize to 0-360
             print(f"[PARSE] Step 9: Normalizing angle...")
             angle = angle % 360.0
             if angle < 0:
                 angle += 360.0
-            print(f"[PARSE] Step 9: ✓ Final angle = {angle}°")
+            print(f"[PARSE] Step 9: ✓ Final angle = {angle:.1f}°")
 
             self.current_angle = angle
 
-            # Step 10: Calculate Z height (already in mm from GRBL X, which is y_mm after swap)
-            # M8 lead screw: 1 revolution = 8mm
-            # GRBL X position is already calibrated in mm (but represents height due to swap)
+            # Step 10: Calculate Z height (already converted to mm in step 6)
+            # M8 lead screw: 1 motor revolution (360°) = 8mm
+            # Full step: 45° motor = 1mm, 90° motor = 2mm, etc.
             z_height_mm = y_mm
-            print(f"[PARSE] Step 10: Z height = {z_height_mm:.3f}mm (from GRBL X, M8 leadscrew)")
+            print(f"[PARSE] Step 10: Z height = {z_height_mm:.1f}mm (actual measurement)")
 
             # Step 11: Log result
             print(f"[PARSE] Step 11: Logging result...")
@@ -885,17 +911,17 @@ class ScannerGUI:
     def update_test_position_display(self):
         """Update position display in test tab
         CORRECTED:
-        - X shows rotation angle (from GRBL Y axis after swap): 0.1mm = 45°
-        - Z shows height (from GRBL X axis after swap): M8 lead screw, already in mm
+        - X shows rotation angle (from GRBL Y): 0.1mm GRBL = 45°, angle = value × 450
+        - Z shows height (from GRBL X): converted to actual mm (GRBL × 10)
         """
         try:
             if hasattr(self, 'test_x_pos_var'):
-                # X shows angle (from GRBL X axis)
+                # X shows angle (from GRBL Y, calculated as GRBL_Y × 450)
                 self.test_x_pos_var.set(f"{self.current_angle:.1f}°")
 
             if hasattr(self, 'test_z_pos_var'):
-                # Z shows height (from GRBL Y axis - M8 leadscrew, GRBL reports in mm)
-                self.test_z_pos_var.set(f"{self.current_y_pos:.2f} mm")
+                # Z shows height (from GRBL X, already converted to actual mm)
+                self.test_z_pos_var.set(f"{self.current_y_pos:.1f} mm")
         except Exception as e:
             self.log_info(f"Error updating position display: {str(e)}")
 
@@ -961,7 +987,13 @@ class ScannerGUI:
             self.distance_canvas.itemconfig(self.distance_bar, fill=color)
 
     def format_gcode_command(self, x_move=0.0, y_move=0.0, z_move=0.0, feed_rate=1.0):
-        """Format G-code commands"""
+        """Format G-code commands
+
+        CALIBRATION:
+        - x_move (rotation, GUI X → GRBL Y): Direct value, 0.1mm = 45°
+        - y_move (height, GUI Z → GRBL X): Convert mm to GRBL units (÷ 10)
+          Example: y_move=2.0mm → G1 X0.2 → motor 90° → 2mm actual movement
+        """
         feed_rate_float = max(1.0, float(feed_rate))
         feed_rate = int(feed_rate_float) if feed_rate_float.is_integer() else feed_rate_float
 
@@ -970,12 +1002,18 @@ class ScannerGUI:
 
         move_parts = ["G1"]
 
+        # Rotation axis: GUI X → GRBL Y (direct value)
         if abs(x_move) >= 0.1:
             x_str = f"{x_move:.1f}".rstrip('0').rstrip('.')
-            move_parts.append(f"Y{x_str}")  # Hoán đổi: x_move gửi xuống Y
+            move_parts.append(f"Y{x_str}")
 
-        if abs(y_move) >= 0.01:  # Allow smaller movements
-            move_parts.append(f"X0.2")  
+        # Height axis: GUI Z → GRBL X (convert mm to GRBL units)
+        # Formula: GRBL_X_value = mm / 10
+        # Example: 2mm → 0.2, 5mm → 0.5, 10mm → 1.0
+        if abs(y_move) >= 0.01:
+            y_grbl_units = y_move * 0.1  # Convert mm to GRBL units
+            y_str = f"{y_grbl_units:.2f}".rstrip('0').rstrip('.')
+            move_parts.append(f"X{y_str}")
 
         if abs(z_move) >= 0.1:
             z_str = f"{z_move:.1f}".rstrip('0').rstrip('.')
@@ -1310,9 +1348,9 @@ class ScannerGUI:
         
         try:
             # Get layer height
-            # Z quay 90 độ = 2mm (theo cú pháp: G1X10F1 = quay Z 1mm, G1X20F1 = quay Z 2mm)
-            # Layer height = 2mm (Z quay 90 degrees)
-            layer_height_mm = 2.0  # Fixed 2mm per layer (Z quay 90 degrees)
+            # With calibration: G1 X0.2 = motor 90° = 2mm actual movement
+            # Layer height = 2mm per layer (can be adjusted)
+            layer_height_mm = 2.0  # Fixed 2mm per layer
             
             # Get number of points per revolution
             try:
@@ -1440,13 +1478,13 @@ class ScannerGUI:
                     break
                 
                 # Move Z up by layer height (ONLY ONCE per rotation)
-                # Note: y_move in format_gcode_command maps to GRBL X, which is height (GUI Z) after swap
-                # Z quay 90 độ = 2mm, lệnh: G1X20F1 (2mm × 10 = 20, vì G1X10F1 = quay Z 1mm)
+                # Note: y_move in format_gcode_command maps to GRBL X (height axis)
+                # format_gcode_command will convert: 2mm → G1 X0.2 (2mm ÷ 10 = 0.2 GRBL units)
                 start_z_before = self.current_y_pos
-                self.log_info(f"=== Moving Z up {layer_height_mm}mm (from {start_z_before:.2f}mm) - Layer {self.current_layer + 1} ===")
+                self.log_info(f"=== Moving Z up {layer_height_mm}mm (from {start_z_before:.1f}mm) - Layer {self.current_layer + 1} ===")
                 
-                # Create command to move Z (y_move maps to GRBL X which is height)
-                # y_move=layer_height_mm will create G1X{layer_height_mm}F1 command
+                # Create command to move Z (y_move will be converted to GRBL X units)
+                # Example: y_move=2.0mm → G1 X0.2 F1 (auto-converted in format_gcode_command)
                 commands = self.format_gcode_command(y_move=layer_height_mm, feed_rate=speed)
                 
                 # Log the command for debugging
@@ -1600,9 +1638,13 @@ class ScannerGUI:
                     self.ax.set_xlim(mid_x - max_range/2 - padding, mid_x + max_range/2 + padding)
                     self.ax.set_ylim(mid_y - max_range/2 - padding, mid_y + max_range/2 + padding)
                     self.ax.set_zlim(mid_z - max_range/2 - padding, mid_z + max_range/2 + padding)
-                    
-                    # Set equal aspect ratio for better 3D view
-                    self.ax.set_box_aspect([1, 1, 1])
+
+                    # Set equal aspect ratio for better 3D view (true scale)
+                    try:
+                        self.ax.set_box_aspect([1, 1, 1])  # Equal aspect ratio
+                    except:
+                        # Fallback for older matplotlib versions
+                        pass
                 else:
                     # Default view if no data
                     self.ax.set_xlim(-10, 10)
