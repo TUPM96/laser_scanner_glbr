@@ -1639,8 +1639,8 @@ class ScannerGUI:
                             if len(layer_x) > 0:
                                 layers.append((layer_x, layer_y, z_val))
 
-                        # Draw vertical mesh connecting layers (skip empty intermediate layers)
-                        # User request: Connect layer to next non-empty layer, no within-layer circles
+                        # Draw vertical lines connecting layers (skip empty intermediate layers)
+                        # User request: Only vertical connections between layers, NO horizontal connections within same layer
                         if len(layers) >= 2:
                             for i in range(len(layers)):
                                 x1, y1, z1 = layers[i]
@@ -1649,24 +1649,16 @@ class ScannerGUI:
                                 for j in range(i + 1, len(layers)):
                                     x2, y2, z2 = layers[j]
 
-                                    # Create vertical mesh strips between corresponding points
+                                    # Draw vertical lines between corresponding points only
                                     n_points = min(len(x1), len(x2))
-                                    if n_points >= 2:
-                                        # Draw vertical quads between corresponding points
-                                        for k in range(n_points - 1):
-                                            # Create quad with vertical connections only
-                                            # Connect point k and k+1 across two layers
-                                            verts = [
-                                                [x1[k], y1[k], z1],        # Point k in layer i
-                                                [x2[k], y2[k], z2],        # Point k in layer j (vertical edge)
-                                                [x2[k+1], y2[k+1], z2],    # Point k+1 in layer j
-                                                [x1[k+1], y1[k+1], z1]     # Point k+1 in layer i (vertical edge)
-                                            ]
-                                            # Draw filled polygon (creates vertical strips, no circles within layers)
-                                            self.ax.plot([v[0] for v in verts] + [verts[0][0]],
-                                                        [v[1] for v in verts] + [verts[0][1]],
-                                                        [v[2] for v in verts] + [verts[0][2]],
-                                                        'b-', alpha=0.3, linewidth=0.5)
+                                    if n_points >= 1:
+                                        # Draw vertical line from each point in layer i to corresponding point in layer j
+                                        for k in range(n_points):
+                                            # Draw vertical line: point k in layer i → point k in layer j
+                                            self.ax.plot([x1[k], x2[k]],
+                                                        [y1[k], y2[k]],
+                                                        [z1, z2],
+                                                        'b-', alpha=0.4, linewidth=0.8)
 
                                     # Only connect to first non-empty layer found
                                     break
