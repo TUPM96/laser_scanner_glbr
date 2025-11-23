@@ -131,7 +131,7 @@ class ScannerGUI:
         ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
-        self.points_per_revolution_var = tk.StringVar(value="360")
+        self.points_per_revolution_var = tk.StringVar(value="8")
         ttk.Entry(geometry_frame, textvariable=self.points_per_revolution_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Chiều cao tối đa (mm):").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=1)
@@ -1034,14 +1034,19 @@ class ScannerGUI:
 
         return commands
 
-    def send_gcode_commands(self, commands, delay=0.05):
-        """Send multiple G-code commands sequentially"""
+    def send_gcode_commands(self, commands, delay=0.1):
+        """Send multiple G-code commands sequentially with delay to prevent buffer overflow"""
         if not self.serial_conn:
             return
 
         for cmd in commands:
-            self.send_serial_command(cmd, log=True)
-            time.sleep(delay)
+            try:
+                self.send_serial_command(cmd, log=True)
+                time.sleep(delay)  # Increased delay to prevent timeout
+            except Exception as e:
+                # Log but continue with remaining commands
+                if "timeout" not in str(e).lower():
+                    self.log_info(f"Command error (continuing): {e}")
 
     def on_speed_change(self, value):
         """Update speed label"""
@@ -1453,20 +1458,37 @@ class ScannerGUI:
                             target_reached = True
                     
                     if target_reached:
-                        # Request sensor reading
-                        if self.serial_conn:
-                            self.send_serial_command("READ_VL53L0X\n", log=False)
-                        time.sleep(0.15)  # Wait for sensor reading to arrive (slower speed)
-                        
-                        # Process point if we have sensor data
-                        if self.current_vl53_distance is not None:
-                            self.process_scan_data_point()
-                            points_collected += 1
-                            last_processed_angle = current_angle
-                            next_target_angle = (next_target_angle + angle_step) % 360.0
-                        else:
-                            self.log_info(f"Warning: No sensor data at angle {current_angle:.1f}°")
-                        
+                        # Request sensor reading with timeout
+                        sensor_data_received = False
+                        try:
+                            if self.serial_conn:
+                                self.send_serial_command("READ_VL53L0X\n", log=False)
+
+                            # Wait for sensor reading with timeout (max 0.5s)
+                            wait_start = time.time()
+                            while time.time() - wait_start < 0.5:
+                                if self.current_vl53_distance is not None:
+                                    sensor_data_received = True
+                                    break
+                                time.sleep(0.05)
+
+                            # Process point if we have sensor data
+                            if sensor_data_received:
+                                self.process_scan_data_point()
+                                points_collected += 1
+                            else:
+                                # Timeout - skip this point
+                                pass  # Silent skip, no log spam
+                        except Exception as e:
+                            # Handle write timeout or other errors gracefully
+                            if "timeout" in str(e).lower():
+                                pass  # Silent skip on timeout
+                            else:
+                                self.log_info(f"Sensor error at {current_angle:.1f}°: {e}")
+
+                        # Always move to next target angle (whether we got data or not)
+                        last_processed_angle = current_angle
+                        next_target_angle = (next_target_angle + angle_step) % 360.0
                         angle_changed = True
                     
                     if abs(current_angle - last_angle) > 0.1:  # Angle is changing
