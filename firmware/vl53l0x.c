@@ -83,9 +83,14 @@ uint16_t vl53l0x_readRangeContinuousMillimeters(void)
   // Start single shot measurement (giống code C thuần)
   vl53_write_reg(VL53L0X_REG_SYSRANGE_START, 0x01);
   
-  // Chờ đo xong (timeout 100ms như code C thuần, nhưng có thể điều chỉnh)
-  uint8_t timeout = 0;
-  uint16_t timeout_limit = (vl53l0x_io_timeout < 100) ? vl53l0x_io_timeout : 100;
+  // Delay nhỏ để sensor bắt đầu đo (VL53L0X cần một chút thời gian để khởi động)
+  _delay_ms(2);
+  
+  // Chờ đo xong - Tăng timeout để đảm bảo đọc được điểm
+  // VL53L0X cần ~30ms cho mỗi lần đo, nhưng có thể lâu hơn trong một số điều kiện
+  // Sử dụng timeout tối đa 500ms (từ vl53l0x_io_timeout) để đảm bảo không mất điểm
+  uint16_t timeout = 0;
+  uint16_t timeout_limit = vl53l0x_io_timeout; // Sử dụng toàn bộ timeout được cấu hình
   
   while (timeout < timeout_limit) {
     uint8_t status = vl53_read_reg(VL53L0X_REG_SYSRANGE_START);
@@ -104,6 +109,8 @@ uint16_t vl53l0x_readRangeContinuousMillimeters(void)
   
   // Đọc kết quả (giống code C thuần)
   uint8_t buffer[12];
+  // Đọc 12 bytes từ VL53L0X (I2C không có giới hạn cứng về số byte, 
+  // nhưng VL53L0X chỉ trả về 12 bytes cho kết quả đo)
   vl53_read_multi(VL53L0X_REG_RESULT_RANGE_STATUS, buffer, 12);
   
   // Distance ở buffer[10] (MSB) và buffer[11] (LSB)

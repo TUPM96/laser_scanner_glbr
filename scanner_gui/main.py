@@ -1006,22 +1006,18 @@ class ScannerGUI:
 
         move_parts = ["G1"]
 
-        # Rotation axis: GUI X → GRBL Y (direct value)
+        # Rotation axis: GUI X → GRBL X (direct value)
         if abs(x_move) >= 0.1:
             x_str = f"{x_move:.1f}".rstrip('0').rstrip('.')
-            move_parts.append(f"Y{x_str}")
+            move_parts.append(f"X{x_str}")
 
-        # Height axis: GUI Z → GRBL X (convert mm to GRBL units)
+        # Height axis: GUI Z → GRBL Y (convert mm to GRBL units)
         # Formula: GRBL_X_value = mm / 10
         # Example: 2mm → 0.2, 5mm → 0.5, 10mm → 1.0
         if abs(y_move) >= 0.01:
             y_grbl_units = y_move * 0.1  # Convert mm to GRBL units
             y_str = f"{y_grbl_units:.2f}".rstrip('0').rstrip('.')
-            move_parts.append(f"X{y_str}")
-
-        if abs(z_move) >= 0.1:
-            z_str = f"{z_move:.1f}".rstrip('0').rstrip('.')
-            move_parts.append(f"Z{z_str}")
+            move_parts.append(f"Y{y_str}")
 
         if isinstance(feed_rate, int) or (isinstance(feed_rate, float) and feed_rate.is_integer()):
             f_str = f"{int(feed_rate)}"
