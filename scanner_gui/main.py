@@ -4,22 +4,22 @@ Python GUI for controlling 3D scanner and visualizing scan data
 
 CORRECTED VERSION - HARDWARE SPECIFICATIONS & CALIBRATION:
 
-ROTATION AXIS (GUI X = GRBL Y):
-- Calibration: 0.1mm GRBL = 45° motor rotation
-- Formula: angle = GRBL_Y_position × 450
-- Full rotation: 360° = 0.8mm GRBL units
+ROTATION AXIS (GUI X = GRBL X):
+- Calibration: 0.1mm GRBL = 10° motor rotation
+- Formula: angle = GRBL_X_position × 100
+- Full rotation: 360° = 3.6mm GRBL units
 - Conversion: Direct value (no scaling needed)
 
-HEIGHT AXIS (GUI Z = GRBL X):
-- Full step mode: G1 X0.1 = 45° motor = 1mm actual movement
+HEIGHT AXIS (GUI Z = GRBL Y):
+- Full step mode: G1 Y0.1 = 45° motor = 1mm actual movement
 - M8 lead screw: 1 motor revolution (360°) = 8mm
-- Formula: actual_mm = GRBL_X_value × 10
-- Conversion when sending: GRBL_X = mm / 10
-- Conversion when parsing: mm = GRBL_X × 10
+- Formula: actual_mm = GRBL_Y_value × 10
+- Conversion when sending: GRBL_Y = mm / 10
+- Conversion when parsing: mm = GRBL_Y × 10
 
 COORDINATE MAPPING:
-- format_gcode_command(): GUI X → GRBL Y (direct), GUI Z → GRBL X (÷10)
-- parse_grbl_status(): GRBL Y → GUI X (direct), GRBL X → GUI Z (×10)
+- format_gcode_command(): GUI X → GRBL X (direct), GUI Z → GRBL Y (÷10)
+- parse_grbl_status(): GRBL X → GUI X (direct), GRBL Y → GUI Z (×10)
 """
 
 import tkinter as tk
@@ -31,6 +31,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from mpl_toolkits.mplot3d import Axes3D
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 import time
 import os
 
@@ -56,12 +57,10 @@ class ScannerGUI:
         self.scan_start_angle = 0.0  # Starting angle for current rotation
 
         # Position tracking - CORRECTED CALIBRATION
-        # Rotation axis (GRBL Y → GUI X): 0.1mm GRBL = 45°, direct value
-        # Height axis (GRBL X → GUI Z): Full step mode, GRBL value × 10 = actual mm
-        # NOTE: format_gcode_command swaps X/Y and scales Z when sending
-        #       parse_grbl_status swaps back and scales Z × 10 when parsing
-        self.current_x_pos = 0.0  # Rotation position in mm (from GRBL Y, direct value)
-        self.current_y_pos = 0.0  # Height position in mm (from GRBL X × 10, actual measurement)
+        # Rotation axis (GRBL X → GUI X): 0.1mm GRBL = 10°, direct value
+        # Height axis (GRBL Y → GUI Z): Full step mode, GRBL value × 10 = actual mm
+        self.current_x_pos = 0.0  # Rotation position in mm (from GRBL X, direct value)
+        self.current_y_pos = 0.0  # Height position in mm (from GRBL Y × 10, actual measurement)
         self.current_z_pos = 0.0  # GRBL Z position in mm (unused)
         self.grbl_state = "Idle"  # GRBL state
 
@@ -123,7 +122,7 @@ class ScannerGUI:
         geometry_frame.grid(row=3, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=3)
 
         ttk.Label(geometry_frame, text="Khoảng cách tâm (cm):").grid(row=0, column=0, sticky=tk.W, pady=1)
-        self.center_distance_var = tk.StringVar(value="15.0")
+        self.center_distance_var = tk.StringVar(value="16.5")
         ttk.Entry(geometry_frame, textvariable=self.center_distance_var, width=8).grid(row=0, column=1, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Bán kính đĩa (cm):").grid(row=0, column=2, sticky=tk.W, padx=(10,0), pady=1)
@@ -131,7 +130,7 @@ class ScannerGUI:
         ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
-        self.points_per_revolution_var = tk.StringVar(value="8")
+        self.points_per_revolution_var = tk.StringVar(value="36")
         ttk.Entry(geometry_frame, textvariable=self.points_per_revolution_var, width=8).grid(row=1, column=1, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Chiều cao tối đa (mm):").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=1)
@@ -355,11 +354,11 @@ class ScannerGUI:
         pos_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=5)
 
         # X position displays angle (from GRBL Y axis after swap)
-        ttk.Label(pos_frame, text="X (Góc quay, 0.1mm=45°):").grid(row=0, column=0, padx=5)
+        ttk.Label(pos_frame, text="X (Góc quay, 0.1mm=10°):").grid(row=0, column=0, padx=5)
         self.test_x_pos_var = tk.StringVar(value="0.0°")
         ttk.Label(pos_frame, textvariable=self.test_x_pos_var, font=("Arial", 10, "bold")).grid(row=0, column=1, padx=5)
 
-        # Z position displays height (from GRBL X axis after swap, M8 lead screw)
+        # Z position displays height (from GRBL Y axis, M8 lead screw)
         ttk.Label(pos_frame, text="Z (Chiều cao, M8 1rev=8mm):").grid(row=0, column=2, padx=5)
         self.test_z_pos_var = tk.StringVar(value="0.0 mm")
         ttk.Label(pos_frame, textvariable=self.test_z_pos_var, font=("Arial", 10, "bold")).grid(row=0, column=3, padx=5)
@@ -473,12 +472,12 @@ class ScannerGUI:
                 self.log_info("=" * 60)
                 self.log_info("3D SCANNER - CALIBRATION INFO")
                 self.log_info("=" * 60)
-                self.log_info("ROTATION (GUI X = GRBL Y):")
-                self.log_info("  • 0.1mm GRBL = 45° motor")
-                self.log_info("  • angle = GRBL_Y × 450")
-                self.log_info("  • 1 full rotation = 0.8mm GRBL")
+                self.log_info("ROTATION (GUI X = GRBL X):")
+                self.log_info("  • 0.1mm GRBL = 10° motor")
+                self.log_info("  • angle = GRBL_X × 100")
+                self.log_info("  • 1 full rotation = 3.6mm GRBL")
                 self.log_info("")
-                self.log_info("HEIGHT (GUI Z = GRBL X):")
+                self.log_info("HEIGHT (GUI Z = GRBL Y):")
                 self.log_info("  • Full step: G1 X0.1 = 45° = 1mm actual")
                 self.log_info("  • M8 lead screw: 1 rev = 8mm")
                 self.log_info("  • Conversion: mm = GRBL_X × 10")
@@ -721,8 +720,8 @@ class ScannerGUI:
 
     def parse_grbl_status(self, status_line):
         """Parse GRBL status report and update position display
-        CORRECTED CALIBRATION: 0.1mm = 45 degrees, so angle = position_mm × 450
-        Mapping: GRBL X -> GUI Z (height), GRBL Y -> GUI X (angle)
+        CORRECTED CALIBRATION: 0.1mm = 10 degrees, so angle = position_mm × 100
+        Mapping: GRBL X -> GUI X (angle), GRBL Y -> GUI Z (height)
         NOTE: format_gcode_command swaps X/Y when sending, so we swap back when parsing
 
         GRBL 0.9j format: <Idle,MPos:0.100,0.000,0.000,WPos:0.100,0.000,0.000>
@@ -784,28 +783,28 @@ class ScannerGUI:
 
             # Step 6: Parse X and Y
             # NOTE: format_gcode_command swaps X and Y when sending:
-            #   GUI X (rotation) → sent as GRBL Y (direct value)
-            #   GUI Y (height) → sent as GRBL X (divided by 10)
-            # So when parsing, we need to swap back:
-            #   positions[0] (GRBL X) = height units → multiply by 10 to get mm
-            #   positions[1] (GRBL Y) = rotation (direct mm value)
+            #   GUI X (rotation) → sent as GRBL X (direct value)
+            #   GUI Z (height) → sent as GRBL Y (divided by 10)
+            # So when parsing:
+            #   positions[0] (GRBL X) = rotation (direct mm value)
+            #   positions[1] (GRBL Y) = height units → multiply by 10 to get mm
             print(f"[PARSE] Step 6: Parsing position values...")
             try:
-                # GRBL Y (positions[1]) is rotation (GUI X) - direct value
-                x_mm = float(positions[1])
-                print(f"[PARSE] Step 6: X (rotation from GRBL Y) = {x_mm} mm")
+                # GRBL X (positions[0]) is rotation (GUI X) - direct value
+                x_mm = float(positions[0])
+                print(f"[PARSE] Step 6: X (rotation from GRBL X) = {x_mm} mm")
             except ValueError as e:
                 print(f"[PARSE] ✗ ERROR parsing X from '{positions[1]}': {e}")
                 print(f"{'='*70}\n")
                 return
 
             try:
-                # GRBL X (positions[0]) is height (GUI Z) - need to multiply by 10
-                # Because: G1 X0.1 = 45° motor = 1mm actual movement
-                # Formula: mm_actual = GRBL_X_value × 10
-                y_grbl_units = float(positions[0])
+                # GRBL Y (positions[1]) is height (GUI Z) - need to multiply by 10
+                # Because: G1 Y0.1 = 45° motor = 1mm actual movement
+                # Formula: mm_actual = GRBL_Y_value × 10
+                y_grbl_units = float(positions[1])
                 y_mm = y_grbl_units * 10.0  # Convert GRBL units to actual mm
-                print(f"[PARSE] Step 6: Y (height from GRBL X) = {y_grbl_units} units = {y_mm:.1f} mm")
+                print(f"[PARSE] Step 6: Y (height from GRBL Y) = {y_grbl_units} units = {y_mm:.1f} mm")
             except ValueError as e:
                 print(f"[PARSE] ✗ ERROR parsing Y from '{positions[0]}': {e}")
                 print(f"{'='*70}\n")
@@ -822,15 +821,15 @@ class ScannerGUI:
 
             # Step 7: Update internal state
             print(f"[PARSE] Step 7: Updating internal variables...")
-            self.current_x_pos = x_mm  # Rotation from GRBL Y (direct mm)
-            self.current_y_pos = y_mm  # Height from GRBL X (converted to actual mm)
+            self.current_x_pos = x_mm  # Rotation from GRBL X (direct mm)
+            self.current_y_pos = y_mm  # Height from GRBL Y (converted to actual mm)
             print(f"[PARSE] Step 7: ✓ Internal state updated")
-            print(f"[PARSE] Step 7: X = {x_mm:.3f}mm (rotation from GRBL Y), Y = {y_mm:.1f}mm (height from GRBL X)")
+            print(f"[PARSE] Step 7: X = {x_mm:.3f}mm (rotation from GRBL X), Y = {y_mm:.1f}mm (height from GRBL Y)")
 
             # Step 8: Calculate angle from X position
             print(f"[PARSE] Step 8: Calculating angle from X position...")
-            print(f"[PARSE] Step 8: Formula: {x_mm:.3f} mm × 450 = ? degrees")
-            angle = x_mm * 450.0
+            print(f"[PARSE] Step 8: Formula: {x_mm:.3f} mm × 100 = ? degrees")
+            angle = x_mm * 100.0
             print(f"[PARSE] Step 8: Raw angle = {angle:.1f}°")
 
             # Step 9: Normalize to 0-360
@@ -915,16 +914,16 @@ class ScannerGUI:
     def update_test_position_display(self):
         """Update position display in test tab
         CORRECTED:
-        - X shows rotation angle (from GRBL Y): 0.1mm GRBL = 45°, angle = value × 450
-        - Z shows height (from GRBL X): converted to actual mm (GRBL × 10)
+        - X shows rotation angle (from GRBL X): 0.1mm GRBL = 10°, angle = value × 100
+        - Z shows height (from GRBL Y): converted to actual mm (GRBL × 10)
         """
         try:
             if hasattr(self, 'test_x_pos_var'):
-                # X shows angle (from GRBL Y, calculated as GRBL_Y × 450)
+                # X shows angle (from GRBL X, calculated as GRBL_X × 100)
                 self.test_x_pos_var.set(f"{self.current_angle:.1f}°")
 
             if hasattr(self, 'test_z_pos_var'):
-                # Z shows height (from GRBL X, already converted to actual mm)
+                # Z shows height (from GRBL Y, already converted to actual mm)
                 self.test_z_pos_var.set(f"{self.current_y_pos:.1f} mm")
         except Exception as e:
             self.log_info(f"Error updating position display: {str(e)}")
@@ -994,9 +993,9 @@ class ScannerGUI:
         """Format G-code commands
 
         CALIBRATION:
-        - x_move (rotation, GUI X → GRBL Y): Direct value, 0.1mm = 45°
-        - y_move (height, GUI Z → GRBL X): Convert mm to GRBL units (÷ 10)
-          Example: y_move=2.0mm → G1 X0.2 → motor 90° → 2mm actual movement
+        - x_move (rotation, GUI X → GRBL X): Direct value, 0.1mm = 10°
+        - y_move (height, GUI Z → GRBL Y): Convert mm to GRBL units (÷ 10)
+          Example: y_move=2.0mm → G1 Y0.2 → motor 90° → 2mm actual movement
         """
         feed_rate_float = max(1.0, float(feed_rate))
         feed_rate = int(feed_rate_float) if feed_rate_float.is_integer() else feed_rate_float
@@ -1007,12 +1006,19 @@ class ScannerGUI:
         move_parts = ["G1"]
 
         # Rotation axis: GUI X → GRBL X (direct value)
-        if abs(x_move) >= 0.1:
-            x_str = f"{x_move:.1f}".rstrip('0').rstrip('.')
+        if abs(x_move) >= 0.0001:  # Reduced threshold for smaller steps
+            # Format with enough precision - ensure at least 3 decimal places for small values
+            if abs(x_move) < 1.0:
+                x_str = f"{x_move:.4f}".rstrip('0').rstrip('.')
+            else:
+                x_str = f"{x_move:.3f}".rstrip('0').rstrip('.')
+            # Ensure we have at least one digit after decimal point for GRBL
+            if '.' not in x_str or x_str.endswith('.'):
+                x_str = f"{x_move:.4f}".rstrip('0').rstrip('.')
             move_parts.append(f"X{x_str}")
 
         # Height axis: GUI Z → GRBL Y (convert mm to GRBL units)
-        # Formula: GRBL_X_value = mm / 10
+        # Formula: GRBL_Y_value = mm / 10
         # Example: 2mm → 0.2, 5mm → 0.5, 10mm → 1.0
         if abs(y_move) >= 0.01:
             y_grbl_units = y_move * 0.1  # Convert mm to GRBL units
@@ -1066,12 +1072,12 @@ class ScannerGUI:
     def calculate_one_revolution_distance(self):
         """Calculate exact distance for 1 full revolution
 
-        X axis (rotation): 360° = 360/450 mm = 0.8mm
-        Because: 0.1mm = 45°, so 1° = 0.1/45 mm, 360° = 360 × (0.1/45) = 0.8mm
+        X axis (rotation): 360° = 360/100 mm = 3.6mm
+        Because: 0.1mm = 10°, so 1° = 0.1/10 mm, 360° = 360 × (0.1/10) = 3.6mm
 
         Y axis (height, M8 lead screw): 1 revolution = 8mm
         """
-        return 0.8  # Fixed value for X axis based on calibration
+        return 3.6  # Fixed value for X axis based on calibration
 
     def move_direction(self, direction):
         """Move in specified direction using G-code"""
@@ -1201,7 +1207,7 @@ class ScannerGUI:
         if self.serial_conn:
             self.send_gcode_commands(commands, delay=0.05)
             cmd_str = " ".join([c.strip() for c in commands])
-            self.log_info(f"X 360° CW (0.8mm): {cmd_str}")
+            self.log_info(f"X 360° CW (3.6mm): {cmd_str}")
 
     def rotate_x_full_ccw_test(self):
         """Rotate X 360° counter-clockwise"""
@@ -1215,7 +1221,7 @@ class ScannerGUI:
         if self.serial_conn:
             self.send_gcode_commands(commands, delay=0.05)
             cmd_str = " ".join([c.strip() for c in commands])
-            self.log_info(f"X 360° CCW (-0.8mm): {cmd_str}")
+            self.log_info(f"X 360° CCW (-3.6mm): {cmd_str}")
 
     def rotate_y_cw_test(self):
         """Move Z up (mapped from GRBL Y)"""
@@ -1289,6 +1295,7 @@ class ScannerGUI:
 
             # Filter 1: Remove negative or zero distances (error readings)
             if distance_cm <= 0:
+                self.log_info(f"⚠ Filtered point at {angle_deg:.1f}°: Invalid distance ({distance_mm:.1f}mm)")
                 return None
 
             # Filter 2: Calculate valid range
@@ -1301,6 +1308,7 @@ class ScannerGUI:
 
             # Filter 3: Remove values outside valid range
             if distance_cm < min_distance_cm or distance_cm > max_distance_cm:
+                self.log_info(f"⚠ Filtered point at {angle_deg:.1f}°: Out of range ({distance_mm:.1f}mm, valid: {min_distance_cm*10:.1f}-{max_distance_cm*10:.1f}mm)")
                 return None  # Out of range, skip this point
 
             # Calculate radius from center
@@ -1309,11 +1317,13 @@ class ScannerGUI:
             radius_from_center = center_distance_cm - distance_cm
 
             # Filter 4: Remove values around 0 (midThresh in MATLAB)
-            # midThreshUpper=0.5, midThreshLower=-0.5
-            mid_thresh_upper = 0.5
-            mid_thresh_lower = -0.5
-            if mid_thresh_lower < radius_from_center < mid_thresh_upper:
-                return None  # Too close to center, likely error
+            # Tắt filter này vì với hình trụ, radius gần 0 là bình thường
+            # Chỉ filter các giá trị rất gần 0 (có thể là noise)
+            # mid_thresh_upper = 0.2  # Disabled - allow points near center
+            # mid_thresh_lower = -0.2  # Disabled - allow points near center
+            # if mid_thresh_lower < radius_from_center < mid_thresh_upper:
+            #     self.log_info(f"⚠ Filtered point at {angle_deg:.1f}°: Too close to center (radius={radius_from_center:.2f}cm)")
+            #     return None  # Too close to center, likely error
 
             # Convert angle to radians
             angle_rad = np.radians(angle_deg)
@@ -1339,12 +1349,15 @@ class ScannerGUI:
         
         # Get current angle and height
         angle = self.current_angle
-        z_height = self.current_y_pos  # Height from GRBL X (after swap)
+        z_height = self.current_y_pos  # Height from GRBL Y
         
         # Calculate 3D point
         point = self.calculate_point_from_scan(angle, self.current_vl53_distance, z_height)
         if point:
-            self.scan_data.append(point)
+            # Store point with angle and height for later connection
+            # Format: (x, y, z, angle, height)
+            point_with_meta = point + (angle, z_height)
+            self.scan_data.append(point_with_meta)
             # Update visualization in main thread (thread-safe)
             self.root.after(0, self.update_visualization)
             self.log_info(f"Point added: angle={angle:.1f}°, dist={self.current_vl53_distance:.1f}mm, z={z_height:.1f}mm, point=({point[0]:.1f}, {point[1]:.1f}, {point[2]:.1f})mm")
@@ -1364,20 +1377,19 @@ class ScannerGUI:
             try:
                 points_per_rev = int(self.points_per_revolution_var.get())
                 if points_per_rev < 1:
-                    points_per_rev = 360
+                    points_per_rev = 36  # Default: 36 points = 10° per step
                     self.log_info(f"Invalid points per revolution, using default: {points_per_rev}")
             except:
-                points_per_rev = 360
+                points_per_rev = 36  # Default: 36 points = 10° per step
                 self.log_info(f"Error reading points per revolution, using default: {points_per_rev}")
             
             # Calculate angle step per point
             angle_step = 360.0 / points_per_rev
             
-            # Calculate one revolution distance (0.8mm for 360 degrees)
+            # Calculate one revolution distance (3.6mm for 360 degrees)
             one_rev_distance = self.calculate_one_revolution_distance()
             
-            # Speed for scan is always 1 (slowest speed for step motor)
-            speed = 1.0
+            speed = 1.0  # Increased from 1.0 to ensure movement is detected
             
             # Calculate step distance in mm for each angle increment
             # angle_step degrees = one_rev_distance * (angle_step / 360.0)
@@ -1385,11 +1397,29 @@ class ScannerGUI:
 
             self.log_info(f"Scan settings: {points_per_rev} points/vòng, {angle_step:.2f}° per point ({step_distance_mm:.3f}mm per step), speed=F{int(speed)}")
 
+            # Track layer number
+            layer_number = 0
+
             while self.is_scanning and not self.scan_paused:
                 # Record starting position
                 start_z = self.current_y_pos
+                layer_number += 1
+                
+                # Count total layers (estimate from max height)
+                try:
+                    max_height = float(self.max_height_var.get())
+                    estimated_total_layers = int(max_height / layer_height_mm) + 1
+                except:
+                    estimated_total_layers = 0
+                
+                # Count points in current layer (points with same height as start_z)
+                points_in_current_layer = sum(1 for p in self.scan_data 
+                                            if len(p) >= 5 and abs(p[4] - start_z) < 0.1)
 
-                self.log_info(f"=== Starting layer at Z={start_z:.2f}mm ===")
+                # Update window title with layer info
+                self.root.title(f"3D Scanner Control - Layer {layer_number}/{estimated_total_layers} at Z={start_z:.2f}mm - Points: {points_in_current_layer}")
+                
+                self.log_info(f"=== Layer {layer_number}/{estimated_total_layers} at Z={start_z:.2f}mm - Current points: {points_in_current_layer} ===")
 
                 # Step-by-step rotation: Move to each angle, STOP, read sensor, then continue
                 points_collected = 0
@@ -1398,13 +1428,16 @@ class ScannerGUI:
                     if not self.is_scanning or self.scan_paused:
                         break
 
-                    # Step 1: Send command to rotate one step (e.g., 45° = 0.1mm)
+                    # Step 1: Send command to rotate one step (e.g., 10° = 0.1mm)
                     current_angle_before = self.current_angle
                     self.log_info(f"Point {point_num + 1}/{points_per_rev}: Rotating {angle_step:.1f}° from {current_angle_before:.1f}°")
 
                     # Send movement command (x_move for rotation axis)
-                    # Note: format_gcode_command maps x_move to GRBL Y (rotation)
+                    # Note: format_gcode_command maps x_move to GRBL X (rotation)
                     move_commands = self.format_gcode_command(x_move=step_distance_mm, feed_rate=speed)
+                    # Log the actual command being sent
+                    cmd_str = " ".join([c.strip() for c in move_commands])
+                    self.log_info(f"→ Sending G-code: {cmd_str}")
                     if self.serial_conn:
                         self.send_gcode_commands(move_commands, delay=0.1)
 
@@ -1429,52 +1462,71 @@ class ScannerGUI:
                     if not angle_moved:
                         self.log_info(f"⚠ Warning: Angle did not change significantly after movement command")
 
-                    # Step 3: Motor is now STOPPED - Read sensor (MUST succeed before continuing)
-                    # CRITICAL: Clear old sensor data to ensure we get FRESH reading
+                    # Step 3: Motor is now STOPPED - Read sensor (single attempt, no retry)
+                    # Clear old sensor data to ensure we get FRESH reading
                     self.current_vl53_distance = None
-                    sensor_data_received = False
-                    retry_count = 0
+                    
+                    # Single attempt to read sensor - if invalid, skip this point
+                    try:
+                        if self.serial_conn:
+                            self.send_serial_command("READ_VL53L0X\n", log=False)
 
-                    # WAIT indefinitely until we get valid sensor data
-                    # Do NOT break out of this loop until we have data
-                    while not sensor_data_received:
-                        try:
-                            if self.serial_conn:
-                                self.send_serial_command("READ_VL53L0X\n", log=False)
-
-                            # Wait for NEW sensor reading (max 0.5s per attempt)
-                            wait_start = time.time()
-                            while time.time() - wait_start < 0.5:
-                                if self.current_vl53_distance is not None:
-                                    # Got fresh data!
+                        # Wait for sensor reading (max 0.5s)
+                        wait_start = time.time()
+                        sensor_data_received = False
+                        while time.time() - wait_start < 0.5:
+                            if self.current_vl53_distance is not None:
+                                # Got data - check if valid
+                                if self.current_vl53_distance > 0 and self.current_vl53_distance < 8190:
                                     sensor_data_received = True
                                     break
-                                time.sleep(0.05)
+                                else:
+                                    # Invalid data, skip this point
+                                    break
+                            time.sleep(0.05)
 
-                            if not sensor_data_received:
-                                retry_count += 1
-                                if retry_count % 5 == 0:  # Log every 5 retries
-                                    self.log_info(f"⏳ Waiting for sensor at angle {self.current_angle:.1f}° (attempt {retry_count})...")
-                                time.sleep(0.1)
-
-                        except Exception as e:
-                            retry_count += 1
-                            if retry_count % 10 == 0:
-                                self.log_info(f"⚠ Sensor error at {self.current_angle:.1f}°: {e} - retrying...")
-                            time.sleep(0.1)
-
-                    # Step 4: Process and draw point (we have valid data now)
-                    self.process_scan_data_point()
-                    points_collected += 1
-                    self.log_info(f"✓ Point {points_collected}/{points_per_rev} at {self.current_angle:.1f}° - Distance: {self.current_vl53_distance}mm")
+                        # Step 4: Process point only if we have valid data
+                        if sensor_data_received:
+                            self.process_scan_data_point()
+                            points_collected += 1
+                            
+                            # Count current points in this layer
+                            current_z = self.current_y_pos
+                            points_in_layer = sum(1 for p in self.scan_data 
+                                                if len(p) >= 5 and abs(p[4] - current_z) < 0.1)
+                            
+                            # Update window title with current layer and point count
+                            try:
+                                max_height = float(self.max_height_var.get())
+                                estimated_total_layers = int(max_height / layer_height_mm) + 1
+                            except:
+                                estimated_total_layers = 0
+                            self.root.title(f"3D Scanner Control - Layer {layer_number}/{estimated_total_layers} at Z={current_z:.2f}mm - Points: {points_in_layer}")
+                            
+                            self.log_info(f"✓ Point {points_collected}/{points_per_rev} at {self.current_angle:.1f}° - Distance: {self.current_vl53_distance}mm (Layer {layer_number}: {points_in_layer} points)")
+                        else:
+                            self.log_info(f"⚠ Skipped point at {self.current_angle:.1f}° - No valid sensor data")
+                    except Exception as e:
+                        self.log_info(f"⚠ Skipped point at {self.current_angle:.1f}° - Error: {e}")
                 
                 self.log_info(f"Rotation complete. Collected {points_collected}/{points_per_rev} points")
+                
+                # Update title after rotation complete
+                current_z = self.current_y_pos
+                points_in_layer = sum(1 for p in self.scan_data 
+                                    if len(p) >= 5 and abs(p[4] - current_z) < 0.1)
+                try:
+                    max_height = float(self.max_height_var.get())
+                    estimated_total_layers = int(max_height / layer_height_mm) + 1
+                except:
+                    estimated_total_layers = 0
+                self.root.title(f"3D Scanner Control - Layer {layer_number}/{estimated_total_layers} at Z={current_z:.2f}mm - Points: {points_in_layer}")
                 
                 if not self.is_scanning or self.scan_paused:
                     break
                 
                 # Move Z up by layer height (ONLY ONCE per rotation)
-                # Note: y_move in format_gcode_command maps to GRBL X (height axis)
+                # Note: y_move in format_gcode_command maps to GRBL Y (height axis)
                 # format_gcode_command will convert: 2mm → G1 X0.2 (2mm ÷ 10 = 0.2 GRBL units)
                 start_z_before = self.current_y_pos
                 self.log_info(f"=== Moving Z up {layer_height_mm}mm (from {start_z_before:.1f}mm) - Layer {self.current_layer + 1} ===")
@@ -1517,6 +1569,9 @@ class ScannerGUI:
             traceback.print_exc()
         finally:
             self.is_scanning = False
+            # Update title when scan stops - show total points
+            total_points = len(self.scan_data)
+            self.root.after(0, lambda: self.root.title(f"3D Scanner Control - Total Points: {total_points}"))
             self.root.after(0, lambda: self.scan_up_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.scan_down_btn.config(state=tk.NORMAL))
             self.root.after(0, lambda: self.pause_btn.config(state=tk.DISABLED))
@@ -1592,43 +1647,262 @@ class ScannerGUI:
                 y_coords = np.array([p[1] for p in self.scan_data])
                 z_coords = np.array([p[2] for p in self.scan_data])
 
-                # Try to create surface mesh if we have enough structured data
+                # Connect points:
+                # 1. Within same layer: connect adjacent angles only if both exist
+                # 2. Across layers: connect same angle across different layers
                 try:
-                    # Get unique Z heights (layers)
-                    unique_z = np.unique(z_coords)
-                    if len(unique_z) >= 2:  # Need at least 2 layers for surface
-                        # Group points by layer
-                        layers = []
-                        for z_val in unique_z:
-                            layer_mask = np.abs(z_coords - z_val) < 0.01  # tolerance 0.01mm
-                            layer_x = x_coords[layer_mask]
-                            layer_y = y_coords[layer_mask]
-                            if len(layer_x) > 0:
-                                layers.append((layer_x, layer_y, z_val))
-
-                        # Draw vertical lines connecting layers (skip empty intermediate layers)
-                        # User request: Only vertical connections between layers, NO horizontal connections within same layer
-                        if len(layers) >= 2:
-                            for i in range(len(layers)):
-                                x1, y1, z1 = layers[i]
-
-                                # Find next non-empty layer (could be i+1, i+2, i+3, etc.)
-                                for j in range(i + 1, len(layers)):
-                                    x2, y2, z2 = layers[j]
-
-                                    # Draw vertical lines between corresponding points only
-                                    n_points = min(len(x1), len(x2))
-                                    if n_points >= 1:
-                                        # Draw vertical line from each point in layer i to corresponding point in layer j
-                                        for k in range(n_points):
-                                            # Draw vertical line: point k in layer i → point k in layer j
-                                            self.ax.plot([x1[k], x2[k]],
-                                                        [y1[k], y2[k]],
-                                                        [z1, z2],
-                                                        'b-', alpha=0.4, linewidth=0.8)
-
-                                    # Only connect to first non-empty layer found
-                                    break
+                    # Extract data: scan_data format is (x, y, z, angle, height)
+                    if len(self.scan_data) > 0 and len(self.scan_data[0]) >= 5:
+                        # Group points by layer (height) first
+                        layer_groups = {}  # height -> list of (x, y, z, angle, index)
+                        angle_tolerance = 1.0  # Match angles within 1 degree
+                        
+                        for idx, point_data in enumerate(self.scan_data):
+                            if len(point_data) >= 5:
+                                x, y, z, angle, height = point_data[:5]
+                                # Round height for grouping (tolerance 0.01mm)
+                                height_key = round(height / 0.01) * 0.01
+                                if height_key not in layer_groups:
+                                    layer_groups[height_key] = []
+                                layer_groups[height_key].append((x, y, z, angle, idx))
+                        
+                        # PART 1: Connect points within same layer (by index order)
+                        for height_key, points in layer_groups.items():
+                            if len(points) < 2:
+                                continue  # Need at least 2 points
+                            
+                            # Sort points by index (order they were added to scan_data)
+                            # Format: (x, y, z, angle, idx)
+                            points_sorted_by_idx = sorted(points, key=lambda p: p[4])  # Sort by idx (index 4)
+                            
+                            # Connect points with adjacent indices in the same layer
+                            # Only connect if indices are exactly consecutive (no gaps)
+                            for i in range(len(points_sorted_by_idx) - 1):
+                                x1, y1, z1, angle1, idx1 = points_sorted_by_idx[i]
+                                x2, y2, z2, angle2, idx2 = points_sorted_by_idx[i + 1]
+                                
+                                # Check if indices are exactly adjacent (consecutive)
+                                idx_diff = idx2 - idx1
+                                
+                                # Only connect if indices are exactly consecutive (idx_diff == 1)
+                                # If there's a gap (e.g., index 4, 5 filtered, 6), don't connect 4-6
+                                if idx_diff == 1:
+                                    # Connect horizontally within same layer (red color)
+                                    self.ax.plot([x1, x2], [y1, y2], [z1, z2],
+                                                'r-', alpha=0.6, linewidth=1.0)
+                            
+                            # Handle wrap-around: connect last point with first point if they wrap around
+                            # (e.g., 350° and 0° should be connected)
+                            if len(points_sorted_by_idx) >= 2:
+                                first_point = points_sorted_by_idx[0]
+                                last_point = points_sorted_by_idx[-1]
+                                
+                                x1_first, y1_first, z1_first, angle1_first, idx1_first = first_point
+                                x1_last, y1_last, z1_last, angle1_last, idx1_last = last_point
+                                
+                                # Check if they wrap around (e.g., last point is near 360° and first is near 0°)
+                                # Calculate angle difference considering wrap-around
+                                angle_diff_wrap = abs(angle1_last - angle1_first)
+                                if angle_diff_wrap > 180:
+                                    angle_diff_wrap = 360 - angle_diff_wrap
+                                
+                                # Check if indices wrap around (last index and first index are consecutive in scan order)
+                                # This happens when scan completes a full rotation
+                                # Expected: if we scan 36 points, last index should be close to first index + 35
+                                # But we need to check if they're actually consecutive in the scan sequence
+                                # For wrap-around, we check if the angle difference is small (e.g., < 15°)
+                                # and if the points are at the start/end of the scan
+                                if angle_diff_wrap < 15.0:  # Points are close in angle (wrap-around)
+                                    # Connect last point with first point (wrap-around)
+                                    self.ax.plot([x1_last, x1_first], [y1_last, y1_first], [z1_last, z1_first],
+                                                'r-', alpha=0.6, linewidth=1.0)
+                        
+                        # PART 2: Create surface mesh between adjacent layers
+                        # Tạo mặt phẳng khi có đủ điểm ở 2 lớp liền kề
+                        sorted_heights = sorted(layer_groups.keys())
+                        
+                        for layer_idx in range(len(sorted_heights) - 1):
+                            height1 = sorted_heights[layer_idx]
+                            height2 = sorted_heights[layer_idx + 1]
+                            
+                            # Get points from both layers
+                            points_layer1 = layer_groups[height1]
+                            points_layer2 = layer_groups[height2]
+                            
+                            # Group by rounded angle (to nearest 3 degrees) for each layer
+                            # Round to 3° for connection, but keep actual angle for point selection
+                            angle_rounded_layer1 = {}  # rounded_angle -> list of (actual_angle, x, y, z)
+                            angle_rounded_layer2 = {}  # rounded_angle -> list of (actual_angle, x, y, z)
+                            
+                            for x, y, z, angle, idx in points_layer1:
+                                rounded_angle = round(angle / 3.0) * 3.0  # Round to nearest 3°
+                                if rounded_angle not in angle_rounded_layer1:
+                                    angle_rounded_layer1[rounded_angle] = []
+                                angle_rounded_layer1[rounded_angle].append((angle, x, y, z))
+                            
+                            for x, y, z, angle, idx in points_layer2:
+                                rounded_angle = round(angle / 3.0) * 3.0  # Round to nearest 3°
+                                if rounded_angle not in angle_rounded_layer2:
+                                    angle_rounded_layer2[rounded_angle] = []
+                                angle_rounded_layer2[rounded_angle].append((angle, x, y, z))
+                            
+                            # Find common rounded angles in both layers
+                            common_rounded_angles = sorted(set(angle_rounded_layer1.keys()) & set(angle_rounded_layer2.keys()))
+                            
+                            # Create triangles between adjacent rounded angles (3° steps)
+                            # Also handle cases where angles might be further apart (e.g., 6°, 9°, etc.)
+                            for i in range(len(common_rounded_angles) - 1):
+                                rounded_angle1 = common_rounded_angles[i]
+                                rounded_angle2 = common_rounded_angles[i + 1]
+                                
+                                # Check if rounded angles are adjacent (3° apart)
+                                angle_diff = abs(rounded_angle2 - rounded_angle1)
+                                if angle_diff > 180:
+                                    angle_diff = 360 - angle_diff
+                                
+                                # Allow up to 12° difference (to handle missing points)
+                                # This creates surfaces even if some points are filtered
+                                if angle_diff <= 12.0:  # More flexible: allow up to 12° gap
+                                    # Both rounded angles exist in both layers - create triangle
+                                    if rounded_angle1 in angle_rounded_layer1 and rounded_angle1 in angle_rounded_layer2 and \
+                                       rounded_angle2 in angle_rounded_layer1 and rounded_angle2 in angle_rounded_layer2:
+                                        # Get points closest to rounded angles
+                                        points1_layer1 = angle_rounded_layer1[rounded_angle1]
+                                        points1_layer2 = angle_rounded_layer2[rounded_angle1]
+                                        points2_layer1 = angle_rounded_layer1[rounded_angle2]
+                                        points2_layer2 = angle_rounded_layer2[rounded_angle2]
+                                        
+                                        # Find points closest to rounded angle
+                                        best1_1 = min(points1_layer1, key=lambda p: abs(p[0] - rounded_angle1))
+                                        best1_2 = min(points1_layer2, key=lambda p: abs(p[0] - rounded_angle1))
+                                        best2_1 = min(points2_layer1, key=lambda p: abs(p[0] - rounded_angle2))
+                                        best2_2 = min(points2_layer2, key=lambda p: abs(p[0] - rounded_angle2))
+                                        
+                                        _, x1_1, y1_1, z1_1 = best1_1
+                                        _, x1_2, y1_2, z1_2 = best1_2
+                                        _, x2_1, y2_1, z2_1 = best2_1
+                                        _, x2_2, y2_2, z2_2 = best2_2
+                                        
+                                        # Create two triangles to form a quad
+                                        # Triangle 1: (angle1 layer1, angle1 layer2, angle2 layer1)
+                                        triangle1 = np.array([[x1_1, y1_1, z1_1],
+                                                              [x1_2, y1_2, z1_2],
+                                                              [x2_1, y2_1, z2_1]])
+                                        # Triangle 2: (angle1 layer2, angle2 layer2, angle2 layer1)
+                                        triangle2 = np.array([[x1_2, y1_2, z1_2],
+                                                              [x2_2, y2_2, z2_2],
+                                                              [x2_1, y2_1, z2_1]])
+                                        
+                                        # Draw triangles as surface (more visible)
+                                        for triangle in [triangle1, triangle2]:
+                                            poly = Poly3DCollection([triangle], alpha=0.5, facecolor='cyan', edgecolor='blue', linewidths=0.8)
+                                            self.ax.add_collection3d(poly)
+                            
+                            # Handle wrap-around: connect last and first rounded angle
+                            if len(common_rounded_angles) >= 2:
+                                rounded_angle_first = common_rounded_angles[0]
+                                rounded_angle_last = common_rounded_angles[-1]
+                                
+                                angle_diff_wrap = (360 - rounded_angle_last) + rounded_angle_first
+                                if abs(angle_diff_wrap - 3.0) < 1.5:  # 3° apart
+                                    if rounded_angle_first in angle_rounded_layer1 and rounded_angle_first in angle_rounded_layer2 and \
+                                       rounded_angle_last in angle_rounded_layer1 and rounded_angle_last in angle_rounded_layer2:
+                                        points_last_layer1 = angle_rounded_layer1[rounded_angle_last]
+                                        points_last_layer2 = angle_rounded_layer2[rounded_angle_last]
+                                        points_first_layer1 = angle_rounded_layer1[rounded_angle_first]
+                                        points_first_layer2 = angle_rounded_layer2[rounded_angle_first]
+                                        
+                                        best_last_1 = min(points_last_layer1, key=lambda p: abs(p[0] - rounded_angle_last))
+                                        best_last_2 = min(points_last_layer2, key=lambda p: abs(p[0] - rounded_angle_last))
+                                        best_first_1 = min(points_first_layer1, key=lambda p: abs(p[0] - rounded_angle_first))
+                                        best_first_2 = min(points_first_layer2, key=lambda p: abs(p[0] - rounded_angle_first))
+                                        
+                                        _, x1_1, y1_1, z1_1 = best_last_1
+                                        _, x1_2, y1_2, z1_2 = best_last_2
+                                        _, x2_1, y2_1, z2_1 = best_first_1
+                                        _, x2_2, y2_2, z2_2 = best_first_2
+                                        
+                                        triangle1 = np.array([[x1_1, y1_1, z1_1],
+                                                              [x1_2, y1_2, z1_2],
+                                                              [x2_1, y2_1, z2_1]])
+                                        triangle2 = np.array([[x1_2, y1_2, z1_2],
+                                                              [x2_2, y2_2, z2_2],
+                                                              [x2_1, y2_1, z2_1]])
+                                        
+                                        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+                                        for triangle in [triangle1, triangle2]:
+                                            poly = Poly3DCollection([triangle], alpha=0.3, facecolor='cyan', edgecolor='blue', linewidths=0.5)
+                                            self.ax.add_collection3d(poly)
+                        
+                        # PART 3: Connect points with same angle across different layers (vertical lines)
+                        # Group points by angle across all layers
+                        angle_groups = {}  # angle_key -> list of (x, y, z, height, index)
+                        
+                        for idx, point_data in enumerate(self.scan_data):
+                            if len(point_data) >= 5:
+                                x, y, z, angle, height = point_data[:5]
+                                # Round angle to nearest degree for grouping
+                                angle_key = round(angle / angle_tolerance) * angle_tolerance
+                                if angle_key not in angle_groups:
+                                    angle_groups[angle_key] = []
+                                angle_groups[angle_key].append((x, y, z, height, idx))
+                        
+                        # For each angle group, connect points across layers (by height)
+                        for angle_key, points in angle_groups.items():
+                            if len(points) < 2:
+                                continue  # Need at least 2 points to connect
+                            
+                            # Sort points by height (Z)
+                            points_sorted = sorted(points, key=lambda p: p[3])  # Sort by height
+                            
+                            # Connect consecutive points in height order (vertical connections)
+                            for i in range(len(points_sorted) - 1):
+                                x1, y1, z1, h1, idx1 = points_sorted[i]
+                                x2, y2, z2, h2, idx2 = points_sorted[i + 1]
+                                
+                                # Only connect if heights are different (different layers)
+                                if abs(h2 - h1) > 0.01:  # Different layers
+                                    self.ax.plot([x1, x2], [y1, y2], [z1, z2],
+                                                'b-', alpha=0.4, linewidth=0.8)
+                    else:
+                        # Fallback: old format without angle metadata
+                        # Get unique Z heights (layers)
+                        unique_z = np.unique(z_coords)
+                        if len(unique_z) >= 2:
+                            # Group points by layer and angle (approximate)
+                            layers_by_angle = {}  # (z, angle_approx) -> (x, y, z)
+                            
+                            for i in range(len(x_coords)):
+                                z_val = z_coords[i]
+                                x_val = x_coords[i]
+                                y_val = y_coords[i]
+                                # Approximate angle from x, y position
+                                angle_approx = np.arctan2(y_val, x_val) * 180 / np.pi
+                                angle_key = round(angle_approx / 1.0) * 1.0  # Round to 1 degree
+                                
+                                layer_key = (z_val, angle_key)
+                                if layer_key not in layers_by_angle:
+                                    layers_by_angle[layer_key] = []
+                                layers_by_angle[layer_key].append((x_val, y_val, z_val))
+                            
+                            # Connect points with same angle across different layers
+                            angle_groups = {}  # angle -> list of (x, y, z) sorted by z
+                            for (z, angle), points in layers_by_angle.items():
+                                if angle not in angle_groups:
+                                    angle_groups[angle] = []
+                                angle_groups[angle].extend(points)
+                            
+                            # Sort each angle group by Z and connect
+                            for angle, points in angle_groups.items():
+                                if len(points) < 2:
+                                    continue
+                                points_sorted = sorted(points, key=lambda p: p[2])  # Sort by Z
+                                for i in range(len(points_sorted) - 1):
+                                    x1, y1, z1 = points_sorted[i]
+                                    x2, y2, z2 = points_sorted[i + 1]
+                                    if abs(z2 - z1) > 0.01:  # Different layers
+                                        self.ax.plot([x1, x2], [y1, y2], [z1, z2],
+                                                    'b-', alpha=0.4, linewidth=0.8)
                 except Exception as e:
                     # If surface creation fails, continue with point cloud
                     print(f"[VIZ] Surface mesh failed: {e}, using point cloud only")
