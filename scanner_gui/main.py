@@ -1697,17 +1697,28 @@ class ScannerGUI:
             # Track layer number
             layer_number = 0
 
+            # Get max height for scan
+            try:
+                max_height = float(self.z_travel_var.get())
+            except:
+                max_height = 100.0  # Default 100mm
+                self.log_info(f"Invalid max height, using default: {max_height}mm")
+            
+            estimated_total_layers = int(max_height / layer_height_mm) + 1
+            start_z_position = self.current_y_pos  # Record starting Z position
+            
+            self.log_info(f"Scan sẽ chạy từ Z={start_z_position:.2f}mm đến Z={start_z_position + max_height:.2f}mm ({estimated_total_layers} lớp)")
+            
             while self.is_scanning and not self.scan_paused:
                 # Record starting position
                 start_z = self.current_y_pos
                 layer_number += 1
                 
-                # Count total layers (estimate from max height)
-                try:
-                    max_height = float(self.max_height_var.get())
-                    estimated_total_layers = int(max_height / layer_height_mm) + 1
-                except:
-                    estimated_total_layers = 0
+                # Check if we've reached max height
+                current_z_height = self.current_y_pos - start_z_position
+                if current_z_height >= max_height:
+                    self.log_info(f"Đã đạt chiều cao tối đa: {current_z_height:.2f}mm >= {max_height:.2f}mm. Dừng scan.")
+                    break
                 
                 # Count points in current layer (points with same height as start_z)
                 points_in_current_layer = sum(1 for p in self.scan_data 
@@ -1806,11 +1817,6 @@ class ScannerGUI:
                                                 if len(p) >= 5 and abs(p[4] - current_z) < 0.1)
                             
                             # Update window title with current layer and point count
-                            try:
-                                max_height = float(self.max_height_var.get())
-                                estimated_total_layers = int(max_height / layer_height_mm) + 1
-                            except:
-                                estimated_total_layers = 0
                             self.root.title(f"3D Scanner Control - Layer {layer_number}/{estimated_total_layers} at Z={current_z:.2f}mm - Points: {points_in_layer}")
                             
                             self.log_info(f"✓ Point {points_collected}/{points_per_rev} at {self.current_angle:.1f}° - Distance: {self.current_vl53_distance}mm (Layer {layer_number}: {points_in_layer} points)")
@@ -1825,14 +1831,15 @@ class ScannerGUI:
                 current_z = self.current_y_pos
                 points_in_layer = sum(1 for p in self.scan_data 
                                     if len(p) >= 5 and abs(p[4] - current_z) < 0.1)
-                try:
-                    max_height = float(self.max_height_var.get())
-                    estimated_total_layers = int(max_height / layer_height_mm) + 1
-                except:
-                    estimated_total_layers = 0
                 self.root.title(f"3D Scanner Control - Layer {layer_number}/{estimated_total_layers} at Z={current_z:.2f}mm - Points: {points_in_layer}")
                 
                 if not self.is_scanning or self.scan_paused:
+                    break
+                
+                # Check again if we've reached max height before moving Z
+                current_z_height = self.current_y_pos - start_z_position
+                if current_z_height >= max_height:
+                    self.log_info(f"Đã đạt chiều cao tối đa: {current_z_height:.2f}mm >= {max_height:.2f}mm. Dừng scan.")
                     break
                 
                 # Move Z up by layer height (ONLY ONCE per rotation)
