@@ -117,6 +117,8 @@ class ScannerGUI:
         self.test_points = []
         self.is_testing = False
         self.vl53_reading_active = False
+        self.z_layer_test_active = False  # Z layer test mode
+        self.z_layer_test_data = []  # Store (z_height, distance) pairs
 
         # Geometry parameters
         geometry_frame = ttk.LabelFrame(control_frame, text="Thông số hình học", padding="5")
@@ -425,6 +427,43 @@ class ScannerGUI:
                                                 command=self.rotate_y_full_ccw_test, state=tk.DISABLED, width=12)
         self.rotate_y_full_ccw_btn.grid(row=1, column=3, padx=5, pady=2)
 
+        # Z Layer Test (kiểm tra lệch tâm)
+        z_test_frame = ttk.LabelFrame(bottom_panel, text="Z Layer Test - Kiểm tra lệch tâm", padding="5")
+        z_test_frame.grid(row=3, column=0, sticky=(tk.W, tk.E), pady=5)
+        
+        # Parameters for Z test
+        z_test_params = ttk.Frame(z_test_frame)
+        z_test_params.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=2)
+        
+        ttk.Label(z_test_params, text="Layer height (mm):").grid(row=0, column=0, sticky=tk.W, padx=2)
+        self.z_test_layer_height_var = tk.StringVar(value="2.0")
+        ttk.Entry(z_test_params, textvariable=self.z_test_layer_height_var, width=8).grid(row=0, column=1, padx=2)
+        
+        ttk.Label(z_test_params, text="Số lớp:").grid(row=0, column=2, sticky=tk.W, padx=(10,2))
+        self.z_test_num_layers_var = tk.StringVar(value="10")
+        ttk.Entry(z_test_params, textvariable=self.z_test_num_layers_var, width=8).grid(row=0, column=3, padx=2)
+        
+        # Start/Stop button
+        self.z_test_btn = ttk.Button(z_test_frame, text="Bắt đầu Test Z", 
+                                     command=self.toggle_z_layer_test, state=tk.DISABLED)
+        self.z_test_btn.grid(row=1, column=0, columnspan=2, pady=5, sticky=(tk.W, tk.E))
+        
+        # Results display
+        z_results_frame = ttk.Frame(z_test_frame)
+        z_results_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        
+        ttk.Label(z_results_frame, text="Kết quả đo (Z height → Distance):", font=("Arial", 9, "bold")).grid(row=0, column=0, sticky=tk.W)
+        
+        self.z_test_results_text = tk.Text(z_results_frame, height=6, width=50, font=("Consolas", 8), wrap=tk.WORD)
+        self.z_test_results_text.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        z_results_scrollbar = ttk.Scrollbar(z_results_frame, orient=tk.VERTICAL, command=self.z_test_results_text.yview)
+        z_results_scrollbar.grid(row=1, column=1, sticky=(tk.N, tk.S))
+        self.z_test_results_text.configure(yscrollcommand=z_results_scrollbar.set)
+        
+        z_test_frame.columnconfigure(0, weight=1)
+        z_results_frame.columnconfigure(0, weight=1)
+        z_results_frame.rowconfigure(1, weight=1)
+
         # Serial communication log
         log_frame = ttk.LabelFrame(bottom_panel, text="Serial Communication Log", padding="5")
         log_frame.grid(row=4, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
@@ -517,6 +556,8 @@ class ScannerGUI:
                     self.rotate_y_ccw_btn.config(state=tk.NORMAL)
                     self.rotate_y_full_cw_btn.config(state=tk.NORMAL)
                     self.rotate_y_full_ccw_btn.config(state=tk.NORMAL)
+                if hasattr(self, 'z_test_btn'):
+                    self.z_test_btn.config(state=tk.NORMAL)
 
                 # Start serial reading thread
                 self.serial_thread = threading.Thread(target=self.read_serial, daemon=True)
@@ -589,6 +630,11 @@ class ScannerGUI:
                 self.move_to_top_btn.config(state=tk.DISABLED)
             if hasattr(self, 'home_btn'):
                 self.home_btn.config(state=tk.DISABLED)
+            if hasattr(self, 'z_test_btn'):
+                self.z_test_btn.config(state=tk.DISABLED)
+                if self.z_layer_test_active:
+                    self.z_layer_test_active = False
+                    self.z_test_btn.config(text="Bắt đầu Test Z")
             self.log_info("Disconnected")
 
     def send_serial_command(self, command, log=True):

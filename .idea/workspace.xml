@@ -4,9 +4,7 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="c62136b7-a7ec-4de2-a6c8-6926338db95d" name="Changes" comment="">
-      <change beforePath="$PROJECT_DIR$/scanner_gui/main.py" beforeDir="false" afterPath="$PROJECT_DIR$/scanner_gui/main.py" afterDir="false" />
-    </list>
+    <list default="true" id="c62136b7-a7ec-4de2-a6c8-6926338db95d" name="Changes" comment="" />
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
     <option name="HIGHLIGHT_NON_ACTIVE_CHANGELIST" value="false" />
@@ -63,7 +61,7 @@
       <workItem from="1763732811695" duration="17660000" />
       <workItem from="1764075207718" duration="16000" />
       <workItem from="1764417204679" duration="10909000" />
-      <workItem from="1764592316155" duration="808000" />
+      <workItem from="1764592316155" duration="1383000" />
     </task>
     <servers />
   </component>
