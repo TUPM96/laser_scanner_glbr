@@ -1417,6 +1417,165 @@ class ScannerGUI:
             cmd_str = " ".join([c.strip() for c in commands])
             self.log_info(f"Z Xuống Hết: {cmd_str}")
 
+    def toggle_z_layer_test(self):
+        """Toggle Z layer test - chỉ chạy Z và đo khoảng cách ở mỗi lớp"""
+        if not self.is_connected:
+            return
+
+        if not self.z_layer_test_active:
+            # Start test
+            self.z_layer_test_active = True
+            self.z_test_btn.config(text="Dừng Test Z")
+            self.z_layer_test_data = []
+            
+            # Clear results
+            if hasattr(self, 'z_test_results_text'):
+                self.z_test_results_text.delete('1.0', tk.END)
+                self.z_test_results_text.insert(tk.END, "Bắt đầu test Z...\n")
+                self.z_test_results_text.insert(tk.END, "Format: Z (mm) → Distance (mm)\n")
+                self.z_test_results_text.insert(tk.END, "=" * 40 + "\n")
+            
+            # Start test thread
+            test_thread = threading.Thread(target=self.z_layer_test_loop, daemon=True)
+            test_thread.start()
+        else:
+            # Stop test
+            self.z_layer_test_active = False
+            self.z_test_btn.config(text="Bắt đầu Test Z")
+            if hasattr(self, 'z_test_results_text'):
+                self.z_test_results_text.insert(tk.END, "\nTest đã dừng.\n")
+
+    def z_layer_test_loop(self):
+        """Z layer test loop - di chuyển Z qua các lớp và đo khoảng cách"""
+        if not self.is_connected or not self.serial_conn:
+            return
+        
+        try:
+            # Get parameters
+            try:
+                layer_height_mm = float(self.z_test_layer_height_var.get())
+                num_layers = int(self.z_test_num_layers_var.get())
+            except:
+                layer_height_mm = 2.0
+                num_layers = 10
+                self.log_info("Invalid parameters, using defaults: layer_height=2.0mm, num_layers=10")
+            
+            speed = 1.0  # Slow speed for accuracy
+            
+            # Get current sensor type
+            current_type = self.vl53_sensor_type_var.get() if hasattr(self, 'vl53_sensor_type_var') else self.vl53_sensor_type
+            
+            self.log_info(f"Bắt đầu Z layer test: {num_layers} lớp, mỗi lớp {layer_height_mm}mm")
+            
+            # Start from current position
+            start_z = self.current_y_pos
+            
+            for layer in range(num_layers):
+                if not self.z_layer_test_active:
+                    break
+                
+                # Get current Z position
+                current_z = self.current_y_pos
+                
+                # Clear old sensor data
+                self.current_vl53_distance = None
+                
+                # Clear serial input buffer
+                if self.serial_conn and self.serial_conn.in_waiting > 0:
+                    try:
+                        self.serial_conn.reset_input_buffer()
+                    except:
+                        pass
+                
+                # Read sensor
+                try:
+                    if self.serial_conn:
+                        if current_type == "VL53L1":
+                            self.send_serial_command("READ_VL53L1\n", log=False)
+                        else:
+                            self.send_serial_command("READ_VL53L0X\n", log=False)
+                    
+                    # Wait for sensor reading (max 1s)
+                    wait_start = time.time()
+                    sensor_data_received = False
+                    while time.time() - wait_start < 1.0:
+                        if self.current_vl53_distance is not None:
+                            if self.current_vl53_distance > 0 and self.current_vl53_distance < 8190:
+                                sensor_data_received = True
+                                break
+                        time.sleep(0.05)
+                    
+                    if sensor_data_received:
+                        distance = self.current_vl53_distance
+                        # Store data
+                        self.z_layer_test_data.append((current_z, distance))
+                        
+                        # Update results display
+                        result_text = f"Z={current_z:6.2f}mm → Distance={distance:6.1f}mm\n"
+                        if hasattr(self, 'z_test_results_text'):
+                            self.root.after(0, lambda txt=result_text: self.z_test_results_text.insert(tk.END, txt))
+                            self.root.after(0, lambda: self.z_test_results_text.see(tk.END))
+                        
+                        self.log_info(f"Layer {layer+1}/{num_layers}: Z={current_z:.2f}mm, Distance={distance:.1f}mm")
+                    else:
+                        result_text = f"Z={current_z:6.2f}mm → ERROR (No data)\n"
+                        if hasattr(self, 'z_test_results_text'):
+                            self.root.after(0, lambda txt=result_text: self.z_test_results_text.insert(tk.END, txt))
+                        self.log_info(f"Layer {layer+1}/{num_layers}: Z={current_z:.2f}mm - No sensor data")
+                except Exception as e:
+                    self.log_info(f"Error reading sensor at layer {layer+1}: {e}")
+                
+                if not self.z_layer_test_active:
+                    break
+                
+                # Move Z up by layer height (except for last layer)
+                if layer < num_layers - 1:
+                    commands = self.format_gcode_command(y_move=layer_height_mm, feed_rate=speed)
+                    if self.serial_conn:
+                        self.send_gcode_commands(commands, delay=0.1)
+                        # Wait for movement to complete
+                        time.sleep(0.5)
+                        
+                        # Wait for Z position to update
+                        wait_start = time.time()
+                        while time.time() - wait_start < 2.0:
+                            if abs(self.current_y_pos - current_z) >= layer_height_mm * 0.5:
+                                break
+                            time.sleep(0.1)
+            
+            # Test complete
+            self.z_layer_test_active = False
+            if hasattr(self, 'z_test_btn'):
+                self.root.after(0, lambda: self.z_test_btn.config(text="Bắt đầu Test Z"))
+            
+            # Summary
+            if hasattr(self, 'z_test_results_text'):
+                summary = "\n" + "=" * 40 + "\n"
+                summary += f"Test hoàn thành: {len(self.z_layer_test_data)} điểm đo\n"
+                if len(self.z_layer_test_data) > 0:
+                    distances = [d[1] for d in self.z_layer_test_data]
+                    min_dist = min(distances)
+                    max_dist = max(distances)
+                    avg_dist = sum(distances) / len(distances)
+                    summary += f"Distance: Min={min_dist:.1f}mm, Max={max_dist:.1f}mm, Avg={avg_dist:.1f}mm\n"
+                    summary += f"Chênh lệch: {max_dist - min_dist:.1f}mm\n"
+                    if max_dist - min_dist > 5.0:
+                        summary += "⚠ Cảnh báo: Chênh lệch lớn (>5mm) - có thể bị lệch tâm!\n"
+                    else:
+                        summary += "✓ Khoảng cách ổn định - cảm biến có vẻ đúng tâm\n"
+                self.root.after(0, lambda txt=summary: self.z_test_results_text.insert(tk.END, txt))
+            
+            self.log_info("Z layer test hoàn thành")
+            
+        except Exception as e:
+            self.log_info(f"Z layer test error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.z_layer_test_active = False
+            if hasattr(self, 'z_test_btn'):
+                self.root.after(0, lambda: self.z_test_btn.config(text="Bắt đầu Test Z"))
+
     def calculate_point_from_scan(self, angle_deg, distance_mm, z_height_mm):
         """Calculate 3D point from scan data
         angle_deg: rotation angle in degrees
