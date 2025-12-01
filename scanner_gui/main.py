@@ -210,7 +210,7 @@ class ScannerGUI:
         self.export_stl_btn.grid(row=0, column=0, padx=2, sticky=(tk.W, tk.E))
 
         self.export_k_btn = ttk.Button(export_frame, text="Export .k", command=self.export_k, state=tk.NORMAL)
-        self.export_obj_btn.grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
+        self.export_k_btn.grid(row=0, column=1, padx=2, sticky=(tk.W, tk.E))
 
         self.export_step_btn = ttk.Button(export_frame, text="Export STEP", command=self.export_step, state=tk.NORMAL)
         self.export_step_btn.grid(row=1, column=0, columnspan=2, padx=2, pady=(5,0), sticky=(tk.W, tk.E))
