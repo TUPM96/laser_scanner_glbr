@@ -13,6 +13,7 @@
 */
 
 #include "grbl.h"
+#include "vl53l1.h"  // Driver sensor VL53L1
 
 // Định nghĩa loại comment cho pre-parsing
 #define COMMENT_NONE 0                // Không có comment
@@ -58,6 +59,29 @@ static void protocol_execute_line(char *line)
     
     // Kiểm tra timeout (giống code mẫu)
     if (vl53l0x_timeoutOccurred()) {
+      // Timeout đã được xử lý trong readRangeContinuousMillimeters
+      // distance sẽ là 0
+    }
+    
+    // Luôn trả về OK để GUI biết command đã được xử lý
+    // GUI sẽ tự xử lý distance = 0 hoặc >= 8190
+    report_status_message(STATUS_OK);
+    
+  } else if (strcmp(line, "READ_VL53L1") == 0) {
+    // Custom command: Read VL53L1 distance sensor (continuous mode)
+    uint16_t distance = vl53l1_readRangeContinuousMillimeters();
+    
+    // Xử lý kết quả giống VL53L0X:
+    // - distance >= 8190: OUT OF RANGE
+    // - distance == 0: ERROR hoặc TIMEOUT
+    // - 20-4000mm: OK (VL53L1 có range xa hơn)
+    
+    printPgmString(PSTR("VL53L1_DISTANCE:"));
+    printInteger((long)distance);
+    printPgmString(PSTR("\r\n"));
+    
+    // Kiểm tra timeout
+    if (vl53l1_timeoutOccurred()) {
       // Timeout đã được xử lý trong readRangeContinuousMillimeters
       // distance sẽ là 0
     }

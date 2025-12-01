@@ -52,7 +52,8 @@ class ScannerGUI:
         self.step_by_step_active = False  # Step-by-step scan mode
         self.scan_step_thread = None  # Thread for sending SCAN_STEP commands
         self.min_points_for_export = 1  # Minimum points required to enable export (allow export with any points)
-        self.current_vl53_distance = None  # Current VL53L0X distance reading in mm
+        self.current_vl53_distance = None  # Current VL53L0X/VL53L1 distance reading in mm
+        self.vl53_sensor_type = "VL53L1"  # Sensor type: "VL53L0X" or "VL53L1" (default: VL53L1)
         self.scan_paused = False
         self.scan_start_angle = 0.0  # Starting angle for current rotation
 
@@ -129,8 +130,8 @@ class ScannerGUI:
         self.disk_radius_var = tk.StringVar(value="5.0")
         ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
         
-        # VL53L0X offset calibration (mm)
-        ttk.Label(geometry_frame, text="VL53L0X Offset (mm):").grid(row=2, column=0, sticky=tk.W, pady=1)
+        # VL53L0X/VL53L1 offset calibration (mm)
+        ttk.Label(geometry_frame, text="VL53 Offset (mm):").grid(row=2, column=0, sticky=tk.W, pady=1)
         self.vl53_offset_var = tk.StringVar(value="0.0")
         ttk.Entry(geometry_frame, textvariable=self.vl53_offset_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
 
@@ -323,31 +324,39 @@ class ScannerGUI:
             btn.grid(row=row, column=col, padx=2, pady=2)
             self.direction_buttons[direction] = btn
 
-        # Right panel: VL53L0X display
-        right_panel = ttk.LabelFrame(main_test_frame, text="VL53L0X Distance Sensor", padding="10")
+        # Right panel: VL53L0X/VL53L1 display
+        right_panel = ttk.LabelFrame(main_test_frame, text="VL53 Distance Sensor", padding="10")
         right_panel.grid(row=0, column=2, sticky=(tk.W, tk.E, tk.N, tk.S), padx=5)
+
+        # Sensor type selection
+        ttk.Label(right_panel, text="Sensor Type:", font=("Arial", 9)).grid(row=0, column=0, sticky=tk.W, pady=2)
+        self.vl53_sensor_type_var = tk.StringVar(value="VL53L1")
+        sensor_type_combo = ttk.Combobox(right_panel, textvariable=self.vl53_sensor_type_var, 
+                                        values=["VL53L0X", "VL53L1"], state="readonly", width=10)
+        sensor_type_combo.grid(row=0, column=1, sticky=tk.W, padx=2, pady=2)
+        sensor_type_combo.bind("<<ComboboxSelected>>", self.on_sensor_type_changed)
 
         # Large distance display
         self.vl53_distance_var = tk.StringVar(value="--")
         distance_display = ttk.Label(right_panel, textvariable=self.vl53_distance_var,
                                     font=("Arial", 24, "bold"), foreground="blue")
-        distance_display.grid(row=0, column=0, pady=10)
+        distance_display.grid(row=1, column=0, pady=10)
 
-        ttk.Label(right_panel, text="mm", font=("Arial", 12)).grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Label(right_panel, text="mm", font=("Arial", 12)).grid(row=1, column=1, sticky=tk.W, padx=5)
 
         # Start/Stop reading button
         self.vl53_read_btn = ttk.Button(right_panel, text="Start Reading",
                                         command=self.toggle_vl53_reading, state=tk.DISABLED)
-        self.vl53_read_btn.grid(row=1, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
+        self.vl53_read_btn.grid(row=2, column=0, columnspan=2, pady=10, sticky=(tk.W, tk.E))
 
         # Status
         self.vl53_status_var = tk.StringVar(value="Stopped")
         ttk.Label(right_panel, textvariable=self.vl53_status_var, foreground="gray").grid(
-            row=2, column=0, columnspan=2, pady=5)
+            row=3, column=0, columnspan=2, pady=5)
 
         # Visual distance bar
         self.distance_canvas = tk.Canvas(right_panel, width=200, height=20, bg="lightgray")
-        self.distance_canvas.grid(row=3, column=0, columnspan=2, pady=10)
+        self.distance_canvas.grid(row=4, column=0, columnspan=2, pady=10)
         self.distance_bar = self.distance_canvas.create_rectangle(0, 0, 0, 20, fill="green")
 
         # Bottom panel: Position display and controls
@@ -728,20 +737,36 @@ class ScannerGUI:
             self.log_info(f"GRBL Alarm: {line}")
             return
 
-        # Handle VL53L0X distance reading
-        if "VL53L0X" in line.upper() or line.startswith("DISTANCE:"):
+        # Handle VL53L0X/VL53L1 distance reading
+        # Format: VL53L1_DISTANCE:138 hoặc VL53L0X_DISTANCE:138
+        if "VL53L0X" in line.upper() or "VL53L1" in line.upper() or line.startswith("DISTANCE:"):
             try:
                 import re
+                # Auto-detect sensor type from response and update UI
+                if "VL53L1" in line.upper():
+                    self.vl53_sensor_type = "VL53L1"
+                    # Update UI dropdown if it exists
+                    if hasattr(self, 'vl53_sensor_type_var'):
+                        self.root.after(0, lambda: self.vl53_sensor_type_var.set("VL53L1"))
+                elif "VL53L0X" in line.upper():
+                    self.vl53_sensor_type = "VL53L0X"
+                    # Update UI dropdown if it exists
+                    if hasattr(self, 'vl53_sensor_type_var'):
+                        self.root.after(0, lambda: self.vl53_sensor_type_var.set("VL53L0X"))
+                
+                # Parse format: VL53L1_DISTANCE:138
                 if ":" in line:
                     parts = line.split(":")
                     if len(parts) > 1:
                         dist_str = parts[1].strip()
+                        # Remove all non-numeric characters except decimal point
                         dist_str = re.sub(r'[^0-9.]', '', dist_str)
                         if dist_str:
                             distance_mm = float(dist_str)
                             self.update_vl53_display(distance_mm)
                             return
 
+                # Fallback: Try to find number with unit (mm/cm)
                 match = re.search(r'(\d+\.?\d*)\s*(mm|cm)', line, re.IGNORECASE)
                 if match:
                     distance = float(match.group(1))
@@ -751,6 +776,7 @@ class ScannerGUI:
                     self.update_vl53_display(distance)
                     return
             except Exception as e:
+                # Silently ignore parse errors
                 pass
             return
 
@@ -1184,15 +1210,29 @@ class ScannerGUI:
             self.update_test_position_display()
             self.log_info("Going to home (G28)")
 
+    def on_sensor_type_changed(self, event=None):
+        """Handle sensor type change"""
+        self.vl53_sensor_type = self.vl53_sensor_type_var.get()
+        if self.vl53_reading_active:
+            # Restart reading with new sensor type
+            self.vl53_reading_active = False
+            time.sleep(0.1)
+            self.vl53_reading_active = True
+            reading_thread = threading.Thread(target=self.continuous_vl53_read, daemon=True)
+            reading_thread.start()
+
     def toggle_vl53_reading(self):
-        """Toggle VL53L0X reading"""
+        """Toggle VL53L0X/VL53L1 reading"""
         if not self.is_connected:
             return
+
+        # Update sensor type from UI
+        self.vl53_sensor_type = self.vl53_sensor_type_var.get()
 
         if not self.vl53_reading_active:
             self.vl53_reading_active = True
             self.vl53_read_btn.config(text="Stop Reading")
-            self.vl53_status_var.set("Reading...")
+            self.vl53_status_var.set(f"Reading {self.vl53_sensor_type}...")
 
             reading_thread = threading.Thread(target=self.continuous_vl53_read, daemon=True)
             reading_thread.start()
@@ -1202,11 +1242,17 @@ class ScannerGUI:
             self.vl53_status_var.set("Stopped")
 
     def continuous_vl53_read(self):
-        """Continuously read from VL53L0X"""
+        """Continuously read from VL53L0X or VL53L1"""
         while self.vl53_reading_active and self.is_connected:
             try:
                 if self.serial_conn:
-                    self.send_serial_command("READ_VL53L0X\n", log=True)
+                    # Get current sensor type from UI
+                    current_type = self.vl53_sensor_type_var.get()
+                    # Use sensor type to determine command
+                    if current_type == "VL53L1":
+                        self.send_serial_command("READ_VL53L1\n", log=True)
+                    else:
+                        self.send_serial_command("READ_VL53L0X\n", log=True)
                 time.sleep(0.2)
             except Exception as e:
                 if self.vl53_reading_active:
@@ -1522,7 +1568,13 @@ class ScannerGUI:
                     # Single attempt to read sensor - if invalid, skip this point
                     try:
                         if self.serial_conn:
-                            self.send_serial_command("READ_VL53L0X\n", log=False)
+                            # Get current sensor type from UI
+                            current_type = self.vl53_sensor_type_var.get() if hasattr(self, 'vl53_sensor_type_var') else self.vl53_sensor_type
+                            # Use sensor type to determine command
+                            if current_type == "VL53L1":
+                                self.send_serial_command("READ_VL53L1\n", log=False)
+                            else:
+                                self.send_serial_command("READ_VL53L0X\n", log=False)
 
                         # Wait for sensor reading (max 0.5s)
                         wait_start = time.time()
