@@ -1305,7 +1305,7 @@ class ScannerGUI:
                     if current_type == "VL53L1":
                         self.send_serial_command("READ_VL53L1\n", log=True)
                     else:
-                    self.send_serial_command("READ_VL53L0X\n", log=True)
+                        self.send_serial_command("READ_VL53L0X\n", log=True)
                 time.sleep(0.2)
             except Exception as e:
                 if self.vl53_reading_active:
@@ -1802,7 +1802,7 @@ class ScannerGUI:
                             if current_type == "VL53L1":
                                 self.send_serial_command("READ_VL53L1\n", log=False)
                             else:
-                            self.send_serial_command("READ_VL53L0X\n", log=False)
+                                self.send_serial_command("READ_VL53L0X\n", log=False)
 
                         # Wait for sensor reading (max 0.5s)
                         wait_start = time.time()
