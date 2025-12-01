@@ -133,9 +133,9 @@ class ScannerGUI:
         ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
         
         # VL53L0X/VL53L1 offset calibration (mm)
-        ttk.Label(geometry_frame, text="VL53 Offset (mm):").grid(row=2, column=0, sticky=tk.W, pady=1)
+        ttk.Label(geometry_frame, text="VL53 Offset (mm):").grid(row=3, column=0, sticky=tk.W, pady=1)
         self.vl53_offset_var = tk.StringVar(value="0.0")
-        ttk.Entry(geometry_frame, textvariable=self.vl53_offset_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
+        ttk.Entry(geometry_frame, textvariable=self.vl53_offset_var, width=8).grid(row=3, column=1, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
         self.points_per_revolution_var = tk.StringVar(value="36")
@@ -144,6 +144,10 @@ class ScannerGUI:
         ttk.Label(geometry_frame, text="Chiều cao tối đa (mm):").grid(row=1, column=2, sticky=tk.W, padx=(10,0), pady=1)
         self.z_travel_var = tk.StringVar(value="100")
         ttk.Entry(geometry_frame, textvariable=self.z_travel_var, width=8).grid(row=1, column=3, sticky=tk.W, padx=2)
+        
+        ttk.Label(geometry_frame, text="Layer height scan (mm):").grid(row=2, column=2, sticky=tk.W, padx=(10,0), pady=1)
+        self.scan_layer_height_var = tk.StringVar(value="2.0")
+        ttk.Entry(geometry_frame, textvariable=self.scan_layer_height_var, width=8).grid(row=2, column=3, sticky=tk.W, padx=2)
 
         # Scan controls
         scan_frame = ttk.Frame(control_frame)
@@ -1665,10 +1669,15 @@ class ScannerGUI:
             return
         
         try:
-            # Get layer height
-            # With calibration: G1 X0.2 = motor 90° = 2mm actual movement
-            # Layer height = 2mm per layer (can be adjusted)
-            layer_height_mm = 2.0  # Fixed 2mm per layer
+            # Get layer height from UI (separate from test layer height)
+            try:
+                layer_height_mm = float(self.scan_layer_height_var.get())
+                if layer_height_mm <= 0:
+                    layer_height_mm = 2.0
+                    self.log_info(f"Invalid layer height, using default: {layer_height_mm}mm")
+            except:
+                layer_height_mm = 2.0  # Default 2mm per layer
+                self.log_info(f"Error reading layer height, using default: {layer_height_mm}mm")
             
             # Get number of points per revolution
             try:
