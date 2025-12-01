@@ -1487,10 +1487,20 @@ class ScannerGUI:
                 # Clear old sensor data
                 self.current_vl53_distance = None
                 
-                # Clear serial input buffer
-                if self.serial_conn and self.serial_conn.in_waiting > 0:
+                # Clear serial input buffer more carefully to prevent losing sensor data
+                if self.serial_conn:
                     try:
-                        self.serial_conn.reset_input_buffer()
+                        # Read any pending data first (this is safer than reset)
+                        max_flush_attempts = 5
+                        for _ in range(max_flush_attempts):
+                            if self.serial_conn.in_waiting > 0:
+                                # Read and discard pending data
+                                self.serial_conn.read(self.serial_conn.in_waiting)
+                                time.sleep(0.05)  # Small delay to let more data arrive if any
+                            else:
+                                break
+                        # Small delay after flushing to ensure buffer is clear
+                        time.sleep(0.1)
                     except:
                         pass
                 
@@ -1501,11 +1511,14 @@ class ScannerGUI:
                             self.send_serial_command("READ_VL53L1\n", log=False)
                         else:
                             self.send_serial_command("READ_VL53L0X\n", log=False)
+                        
+                        # Small delay after sending command to ensure it's sent
+                        time.sleep(0.1)
                     
-                    # Wait for sensor reading (max 1s)
+                    # Wait for sensor reading (increased to 1.5s to handle buffer delays)
                     wait_start = time.time()
                     sensor_data_received = False
-                    while time.time() - wait_start < 1.0:
+                    while time.time() - wait_start < 1.5:
                         if self.current_vl53_distance is not None:
                             if self.current_vl53_distance > 0 and self.current_vl53_distance < 8190:
                                 sensor_data_received = True
@@ -1786,10 +1799,21 @@ class ScannerGUI:
                     # Clear old sensor data to ensure we get FRESH reading
                     self.current_vl53_distance = None
                     
-                    # Clear serial input buffer before reading sensor to prevent timeout
-                    if self.serial_conn and self.serial_conn.in_waiting > 0:
+                    # Clear serial input buffer more carefully to prevent losing sensor data
+                    # First, read and discard any pending data to avoid clearing data in transit
+                    if self.serial_conn:
                         try:
-                            self.serial_conn.reset_input_buffer()
+                            # Read any pending data first (this is safer than reset)
+                            max_flush_attempts = 5
+                            for _ in range(max_flush_attempts):
+                                if self.serial_conn.in_waiting > 0:
+                                    # Read and discard pending data
+                                    self.serial_conn.read(self.serial_conn.in_waiting)
+                                    time.sleep(0.05)  # Small delay to let more data arrive if any
+                                else:
+                                    break
+                            # Small delay after flushing to ensure buffer is clear
+                            time.sleep(0.1)
                         except:
                             pass
                     
@@ -1803,11 +1827,14 @@ class ScannerGUI:
                                 self.send_serial_command("READ_VL53L1\n", log=False)
                             else:
                                 self.send_serial_command("READ_VL53L0X\n", log=False)
+                            
+                            # Small delay after sending command to ensure it's sent
+                            time.sleep(0.1)
 
-                        # Wait for sensor reading (max 0.5s)
+                        # Wait for sensor reading (increased to 1.5s to handle buffer delays)
                         wait_start = time.time()
                         sensor_data_received = False
-                        while time.time() - wait_start < 0.5:
+                        while time.time() - wait_start < 1.5:
                             if self.current_vl53_distance is not None:
                                 # Got data - check if valid
                                 if self.current_vl53_distance > 0 and self.current_vl53_distance < 8190:
