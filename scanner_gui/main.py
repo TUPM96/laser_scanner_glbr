@@ -1775,46 +1775,67 @@ class ScannerGUI:
                     if self.serial_conn:
                         self.send_gcode_commands(move_commands, delay=0.1)
 
-                    # Step 2: Wait for motor to complete movement (motor STOPS at target)
+                    # Step 2: Wait for motor to complete movement and request status report
                     # Wait at least 0.5s for movement to complete
                     time.sleep(0.5)
+                    
+                    # Request status report to get updated position
+                    # GRBL only sends status when requested with "?" or when in certain states
+                    if self.serial_conn:
+                        # Request status report multiple times to ensure we get the update
+                        for status_request in range(3):
+                            self.send_serial_command("?\n", log=False)
+                            time.sleep(0.2)  # Wait for status report to arrive
 
-                    # Verify angle has changed
-                    movement_timeout = time.time() + 5.0  # Max 5s for movement
+                    # Verify angle has changed by checking status reports
+                    movement_timeout = time.time() + 3.0  # Max 3s for movement verification
                     angle_moved = False
+                    last_angle_check = current_angle_before
+                    
                     while time.time() < movement_timeout:
+                        # Request status report again if needed
+                        if self.serial_conn and not angle_moved:
+                            self.send_serial_command("?\n", log=False)
+                            time.sleep(0.15)  # Wait for response
+                        
                         current_angle_after = self.current_angle
                         angle_diff = abs(current_angle_after - current_angle_before)
                         if angle_diff > 180:
                             angle_diff = 360 - angle_diff
 
-                        if angle_diff >= angle_step * 0.3:  # At least 30% of expected movement
+                        # Check if angle changed (at least 20% of expected movement, or any change if small step)
+                        min_change = max(angle_step * 0.2, 1.0)  # At least 1 degree or 20% of step
+                        if angle_diff >= min_change:
                             angle_moved = True
+                            self.log_info(f"✓ Angle updated: {current_angle_before:.1f}° → {current_angle_after:.1f}° (diff: {angle_diff:.1f}°)")
                             break
+                        
+                        # If angle changed at all (even small), consider it progress
+                        if abs(current_angle_after - last_angle_check) > 0.1:
+                            last_angle_check = current_angle_after
+                            # Continue waiting for full movement
+                        
                         time.sleep(0.1)
 
                     if not angle_moved:
-                        self.log_info(f"⚠ Warning: Angle did not change significantly after movement command")
+                        self.log_info(f"⚠ Warning: Angle did not change significantly after movement command (still at {self.current_angle:.1f}°)")
+                        # Try one more status request
+                        if self.serial_conn:
+                            self.send_serial_command("?\n", log=False)
+                            time.sleep(0.3)
+                            self.log_info(f"   After retry: angle = {self.current_angle:.1f}°")
 
                     # Step 3: Motor is now STOPPED - Read sensor (single attempt, no retry)
                     # Clear old sensor data to ensure we get FRESH reading
                     self.current_vl53_distance = None
                     
-                    # Clear serial input buffer more carefully to prevent losing sensor data
-                    # First, read and discard any pending data to avoid clearing data in transit
+                    # Clear serial input buffer before reading sensor
                     if self.serial_conn:
                         try:
-                            # Read any pending data first (this is safer than reset)
-                            max_flush_attempts = 5
-                            for _ in range(max_flush_attempts):
-                                if self.serial_conn.in_waiting > 0:
-                                    # Read and discard pending data
-                                    self.serial_conn.read(self.serial_conn.in_waiting)
-                                    time.sleep(0.05)  # Small delay to let more data arrive if any
-                                else:
-                                    break
-                            # Small delay after flushing to ensure buffer is clear
-                            time.sleep(0.1)
+                            # Clear all pending data in buffer
+                            if self.serial_conn.in_waiting > 0:
+                                self.serial_conn.reset_input_buffer()
+                            time.sleep(0.05)  # Small delay after clearing
                         except:
                             pass
                     
@@ -1832,10 +1853,10 @@ class ScannerGUI:
                             # Small delay after sending command to ensure it's sent
                             time.sleep(0.1)
 
-                        # Wait for sensor reading (increased to 1.5s to handle buffer delays)
+                        # Wait for sensor reading (normal wait time: 1.0s)
                         wait_start = time.time()
                         sensor_data_received = False
-                        while time.time() - wait_start < 1.5:
+                        while time.time() - wait_start < 1.0:
                             if self.current_vl53_distance is not None:
                                 # Got data - check if valid
                                 if self.current_vl53_distance > 0 and self.current_vl53_distance < 8190:
@@ -1845,6 +1866,17 @@ class ScannerGUI:
                                     # Invalid data, skip this point
                                     break
                             time.sleep(0.05)
+                        
+                        # If no data received, clear buffer and continue to next point
+                        if not sensor_data_received:
+                            # Clear buffer to remove any stale data
+                            if self.serial_conn:
+                                try:
+                                    if self.serial_conn.in_waiting > 0:
+                                        self.serial_conn.reset_input_buffer()
+                                except:
+                                    pass
+                            self.current_vl53_distance = None  # Clear sensor data
 
                         # Step 4: Process point only if we have valid data
                         if sensor_data_received:
