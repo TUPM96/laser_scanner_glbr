@@ -128,6 +128,11 @@ class ScannerGUI:
         ttk.Label(geometry_frame, text="Bán kính đĩa (cm):").grid(row=0, column=2, sticky=tk.W, padx=(10,0), pady=1)
         self.disk_radius_var = tk.StringVar(value="5.0")
         ttk.Entry(geometry_frame, textvariable=self.disk_radius_var, width=8).grid(row=0, column=3, sticky=tk.W, padx=2)
+        
+        # VL53L0X offset calibration (mm)
+        ttk.Label(geometry_frame, text="VL53L0X Offset (mm):").grid(row=2, column=0, sticky=tk.W, pady=1)
+        self.vl53_offset_var = tk.StringVar(value="0.0")
+        ttk.Entry(geometry_frame, textvariable=self.vl53_offset_var, width=8).grid(row=2, column=1, sticky=tk.W, padx=2)
 
         ttk.Label(geometry_frame, text="Số điểm scan/vòng:").grid(row=1, column=0, sticky=tk.W, pady=1)
         self.points_per_revolution_var = tk.StringVar(value="36")
@@ -460,7 +465,7 @@ class ScannerGUI:
                 return
 
             try:
-                self.serial_conn = serial.Serial(port, 115200, timeout=1)
+                self.serial_conn = serial.Serial(port, 115200, timeout=2, write_timeout=2)  # Increased timeout to 2s
                 time.sleep(2)
                 self.is_connected = True
                 self.connect_btn.config(text="Disconnect")
@@ -581,13 +586,35 @@ class ScannerGUI:
         """Send command to serial and log it"""
         if self.serial_conn:
             try:
+                # Clear input buffer before sending to prevent timeout
+                if self.serial_conn.in_waiting > 0:
+                    self.serial_conn.reset_input_buffer()
+                
+                # Clear output buffer if it's getting full (prevent write timeout)
+                try:
+                    if hasattr(self.serial_conn, 'out_waiting') and self.serial_conn.out_waiting > 100:
+                        self.serial_conn.reset_output_buffer()
+                except:
+                    pass  # Some serial implementations don't support out_waiting
+                
                 if isinstance(command, str):
                     command_bytes = command.encode()
                 else:
                     command_bytes = command
 
-                # Send to serial
-                self.serial_conn.write(command_bytes)
+                # Send to serial with timeout handling
+                try:
+                    self.serial_conn.write(command_bytes)
+                    self.serial_conn.flush()  # Ensure data is sent immediately
+                except serial.SerialTimeoutException:
+                    # If write timeout, clear output buffer and retry once
+                    try:
+                        self.serial_conn.reset_output_buffer()
+                        time.sleep(0.1)  # Small delay
+                        self.serial_conn.write(command_bytes)
+                        self.serial_conn.flush()
+                    except Exception as retry_e:
+                        raise Exception(f"Write timeout (retry failed): {retry_e}")
 
                 if log:
                     try:
@@ -629,6 +656,9 @@ class ScannerGUI:
                     if line:
                         # CALLBACK: Log ALL serial data to console
                         self.on_serial_received(line)
+                else:
+                    # If no data waiting, clear any stale data in buffer periodically
+                    time.sleep(0.01)  # Small delay to prevent CPU spinning
             except Exception as e:
                 if self.is_connected:
                     self.log_info(f"Serial error: {str(e)}")
@@ -670,6 +700,15 @@ class ScannerGUI:
 
     def process_serial_data(self, line):
         """Process incoming serial data from GRBL firmware"""
+        # Clear input buffer after processing to prevent overflow
+        if self.serial_conn and self.serial_conn.in_waiting > 100:  # If buffer has more than 100 bytes
+            try:
+                # Read and discard excess data
+                while self.serial_conn.in_waiting > 50:
+                    self.serial_conn.read(self.serial_conn.in_waiting)
+            except:
+                pass
+        
         # Handle GRBL status reports: <Idle|MPos:0.000,0.000,0.000|FS:0,0>
         if line.startswith("<"):
             # ============================================
@@ -947,9 +986,16 @@ class ScannerGUI:
             pass
 
     def update_vl53_display(self, distance_mm):
-        """Update VL53L0X distance display"""
+        """Update VL53L0X distance display with offset calibration"""
         # Store current distance reading for scan processing
         if distance_mm > 0 and distance_mm < 8190:
+            # Apply offset calibration
+            try:
+                offset = float(self.vl53_offset_var.get())
+                distance_mm = distance_mm + offset
+            except:
+                offset = 0.0
+            
             self.current_vl53_distance = distance_mm
         
         if hasattr(self, 'vl53_distance_var'):
@@ -1466,6 +1512,13 @@ class ScannerGUI:
                     # Clear old sensor data to ensure we get FRESH reading
                     self.current_vl53_distance = None
                     
+                    # Clear serial input buffer before reading sensor to prevent timeout
+                    if self.serial_conn and self.serial_conn.in_waiting > 0:
+                        try:
+                            self.serial_conn.reset_input_buffer()
+                        except:
+                            pass
+                    
                     # Single attempt to read sensor - if invalid, skip this point
                     try:
                         if self.serial_conn:
@@ -1637,7 +1690,7 @@ class ScannerGUI:
         self.log_info("Send config not implemented")
 
     def update_visualization(self):
-        """Update 3D visualization with scan data - surface mesh + point cloud"""
+        """Update 3D visualization with scan data - improved surface mesh + point cloud"""
         try:
             self.ax.clear()
 
@@ -1647,331 +1700,244 @@ class ScannerGUI:
                 y_coords = np.array([p[1] for p in self.scan_data])
                 z_coords = np.array([p[2] for p in self.scan_data])
 
-                # Connect points:
-                # 1. Within same layer: connect adjacent angles only if both exist
-                # 2. Across layers: connect same angle across different layers
+                # ============================================
+                # IMPROVED MESH GENERATION
+                # ============================================
                 try:
-                    # Extract data: scan_data format is (x, y, z, angle, height)
                     if len(self.scan_data) > 0 and len(self.scan_data[0]) >= 5:
-                        # Group points by layer (height) first
+                        print(f"\n[MESH] Starting mesh generation with {len(self.scan_data)} points")
+
+                        # Step 1: Group points by layer (height)
                         layer_groups = {}  # height -> list of (x, y, z, angle, index)
-                        angle_tolerance = 1.0  # Match angles within 1 degree
-                        
+
                         for idx, point_data in enumerate(self.scan_data):
                             if len(point_data) >= 5:
                                 x, y, z, angle, height = point_data[:5]
-                                # Round height for grouping (tolerance 0.01mm)
-                                height_key = round(height / 0.01) * 0.01
+                                # Round height to 0.1mm precision for grouping
+                                height_key = round(height, 1)
                                 if height_key not in layer_groups:
                                     layer_groups[height_key] = []
                                 layer_groups[height_key].append((x, y, z, angle, idx))
-                        
-                        # PART 1: Connect points within same layer (by index order)
-                        for height_key, points in layer_groups.items():
-                            if len(points) < 2:
-                                continue  # Need at least 2 points
-                            
-                            # Sort points by index (order they were added to scan_data)
-                            # Format: (x, y, z, angle, idx)
-                            points_sorted_by_idx = sorted(points, key=lambda p: p[4])  # Sort by idx (index 4)
-                            
-                            # Connect points with adjacent indices in the same layer
-                            # Only connect if indices are exactly consecutive (no gaps)
-                            for i in range(len(points_sorted_by_idx) - 1):
-                                x1, y1, z1, angle1, idx1 = points_sorted_by_idx[i]
-                                x2, y2, z2, angle2, idx2 = points_sorted_by_idx[i + 1]
-                                
-                                # Check if indices are exactly adjacent (consecutive)
-                                idx_diff = idx2 - idx1
-                                
-                                # Only connect if indices are exactly consecutive (idx_diff == 1)
-                                # If there's a gap (e.g., index 4, 5 filtered, 6), don't connect 4-6
-                                if idx_diff == 1:
-                                    # Connect horizontally within same layer (red color)
-                                    self.ax.plot([x1, x2], [y1, y2], [z1, z2],
-                                                'r-', alpha=0.6, linewidth=1.0)
-                            
-                            # Handle wrap-around: connect last point with first point if they wrap around
-                            # (e.g., 350° and 0° should be connected)
-                            if len(points_sorted_by_idx) >= 2:
-                                first_point = points_sorted_by_idx[0]
-                                last_point = points_sorted_by_idx[-1]
-                                
-                                x1_first, y1_first, z1_first, angle1_first, idx1_first = first_point
-                                x1_last, y1_last, z1_last, angle1_last, idx1_last = last_point
-                                
-                                # Check if they wrap around (e.g., last point is near 360° and first is near 0°)
-                                # Calculate angle difference considering wrap-around
-                                angle_diff_wrap = abs(angle1_last - angle1_first)
-                                if angle_diff_wrap > 180:
-                                    angle_diff_wrap = 360 - angle_diff_wrap
-                                
-                                # Check if indices wrap around (last index and first index are consecutive in scan order)
-                                # This happens when scan completes a full rotation
-                                # Expected: if we scan 36 points, last index should be close to first index + 35
-                                # But we need to check if they're actually consecutive in the scan sequence
-                                # For wrap-around, we check if the angle difference is small (e.g., < 15°)
-                                # and if the points are at the start/end of the scan
-                                if angle_diff_wrap < 15.0:  # Points are close in angle (wrap-around)
-                                    # Connect last point with first point (wrap-around)
-                                    self.ax.plot([x1_last, x1_first], [y1_last, y1_first], [z1_last, z1_first],
-                                                'r-', alpha=0.6, linewidth=1.0)
-                        
-                        # PART 2: Create surface mesh between adjacent layers
-                        # Tạo mặt phẳng khi có đủ điểm ở 2 lớp liền kề
+
+                        print(f"[MESH] Found {len(layer_groups)} layers")
+
+                        # Step 2: Sort layers by height
                         sorted_heights = sorted(layer_groups.keys())
-                        
+
+                        # Step 3: Create mesh between adjacent layers
+                        total_triangles = 0
+
                         for layer_idx in range(len(sorted_heights) - 1):
                             height1 = sorted_heights[layer_idx]
                             height2 = sorted_heights[layer_idx + 1]
-                            
-                            # Get points from both layers
-                            points_layer1 = layer_groups[height1]
-                            points_layer2 = layer_groups[height2]
-                            
-                            # Group by rounded angle (to nearest 3 degrees) for each layer
-                            # Round to 3° for connection, but keep actual angle for point selection
-                            angle_rounded_layer1 = {}  # rounded_angle -> list of (actual_angle, x, y, z)
-                            angle_rounded_layer2 = {}  # rounded_angle -> list of (actual_angle, x, y, z)
-                            
-                            for x, y, z, angle, idx in points_layer1:
-                                rounded_angle = round(angle / 3.0) * 3.0  # Round to nearest 3°
-                                if rounded_angle not in angle_rounded_layer1:
-                                    angle_rounded_layer1[rounded_angle] = []
-                                angle_rounded_layer1[rounded_angle].append((angle, x, y, z))
-                            
-                            for x, y, z, angle, idx in points_layer2:
-                                rounded_angle = round(angle / 3.0) * 3.0  # Round to nearest 3°
-                                if rounded_angle not in angle_rounded_layer2:
-                                    angle_rounded_layer2[rounded_angle] = []
-                                angle_rounded_layer2[rounded_angle].append((angle, x, y, z))
-                            
-                            # Find common rounded angles in both layers
-                            common_rounded_angles = sorted(set(angle_rounded_layer1.keys()) & set(angle_rounded_layer2.keys()))
-                            
-                            # Create triangles between adjacent rounded angles (3° steps)
-                            # Also handle cases where angles might be further apart (e.g., 6°, 9°, etc.)
-                            for i in range(len(common_rounded_angles) - 1):
-                                rounded_angle1 = common_rounded_angles[i]
-                                rounded_angle2 = common_rounded_angles[i + 1]
-                                
-                                # Check if rounded angles are adjacent (3° apart)
-                                angle_diff = abs(rounded_angle2 - rounded_angle1)
-                                if angle_diff > 180:
-                                    angle_diff = 360 - angle_diff
-                                
-                                # Allow up to 12° difference (to handle missing points)
-                                # This creates surfaces even if some points are filtered
-                                if angle_diff <= 12.0:  # More flexible: allow up to 12° gap
-                                    # Both rounded angles exist in both layers - create triangle
-                                    if rounded_angle1 in angle_rounded_layer1 and rounded_angle1 in angle_rounded_layer2 and \
-                                       rounded_angle2 in angle_rounded_layer1 and rounded_angle2 in angle_rounded_layer2:
-                                        # Get points closest to rounded angles
-                                        points1_layer1 = angle_rounded_layer1[rounded_angle1]
-                                        points1_layer2 = angle_rounded_layer2[rounded_angle1]
-                                        points2_layer1 = angle_rounded_layer1[rounded_angle2]
-                                        points2_layer2 = angle_rounded_layer2[rounded_angle2]
-                                        
-                                        # Find points closest to rounded angle
-                                        best1_1 = min(points1_layer1, key=lambda p: abs(p[0] - rounded_angle1))
-                                        best1_2 = min(points1_layer2, key=lambda p: abs(p[0] - rounded_angle1))
-                                        best2_1 = min(points2_layer1, key=lambda p: abs(p[0] - rounded_angle2))
-                                        best2_2 = min(points2_layer2, key=lambda p: abs(p[0] - rounded_angle2))
-                                        
-                                        _, x1_1, y1_1, z1_1 = best1_1
-                                        _, x1_2, y1_2, z1_2 = best1_2
-                                        _, x2_1, y2_1, z2_1 = best2_1
-                                        _, x2_2, y2_2, z2_2 = best2_2
-                                        
-                                        # Create two triangles to form a quad
-                                        # Triangle 1: (angle1 layer1, angle1 layer2, angle2 layer1)
-                                        triangle1 = np.array([[x1_1, y1_1, z1_1],
-                                                              [x1_2, y1_2, z1_2],
-                                                              [x2_1, y2_1, z2_1]])
-                                        # Triangle 2: (angle1 layer2, angle2 layer2, angle2 layer1)
-                                        triangle2 = np.array([[x1_2, y1_2, z1_2],
-                                                              [x2_2, y2_2, z2_2],
-                                                              [x2_1, y2_1, z2_1]])
-                                        
-                                        # Draw triangles as surface (more visible)
-                                        for triangle in [triangle1, triangle2]:
-                                            poly = Poly3DCollection([triangle], alpha=0.5, facecolor='cyan', edgecolor='blue', linewidths=0.8)
-                                            self.ax.add_collection3d(poly)
-                            
-                            # Handle wrap-around: connect last and first rounded angle
-                            if len(common_rounded_angles) >= 2:
-                                rounded_angle_first = common_rounded_angles[0]
-                                rounded_angle_last = common_rounded_angles[-1]
-                                
-                                angle_diff_wrap = (360 - rounded_angle_last) + rounded_angle_first
-                                if abs(angle_diff_wrap - 3.0) < 1.5:  # 3° apart
-                                    if rounded_angle_first in angle_rounded_layer1 and rounded_angle_first in angle_rounded_layer2 and \
-                                       rounded_angle_last in angle_rounded_layer1 and rounded_angle_last in angle_rounded_layer2:
-                                        points_last_layer1 = angle_rounded_layer1[rounded_angle_last]
-                                        points_last_layer2 = angle_rounded_layer2[rounded_angle_last]
-                                        points_first_layer1 = angle_rounded_layer1[rounded_angle_first]
-                                        points_first_layer2 = angle_rounded_layer2[rounded_angle_first]
-                                        
-                                        best_last_1 = min(points_last_layer1, key=lambda p: abs(p[0] - rounded_angle_last))
-                                        best_last_2 = min(points_last_layer2, key=lambda p: abs(p[0] - rounded_angle_last))
-                                        best_first_1 = min(points_first_layer1, key=lambda p: abs(p[0] - rounded_angle_first))
-                                        best_first_2 = min(points_first_layer2, key=lambda p: abs(p[0] - rounded_angle_first))
-                                        
-                                        _, x1_1, y1_1, z1_1 = best_last_1
-                                        _, x1_2, y1_2, z1_2 = best_last_2
-                                        _, x2_1, y2_1, z2_1 = best_first_1
-                                        _, x2_2, y2_2, z2_2 = best_first_2
-                                        
-                                        triangle1 = np.array([[x1_1, y1_1, z1_1],
-                                                              [x1_2, y1_2, z1_2],
-                                                              [x2_1, y2_1, z2_1]])
-                                        triangle2 = np.array([[x1_2, y1_2, z1_2],
-                                                              [x2_2, y2_2, z2_2],
-                                                              [x2_1, y2_1, z2_1]])
-                                        
-                                        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-                                        for triangle in [triangle1, triangle2]:
-                                            poly = Poly3DCollection([triangle], alpha=0.3, facecolor='cyan', edgecolor='blue', linewidths=0.5)
-                                            self.ax.add_collection3d(poly)
-                        
-                        # PART 3: Connect points with same angle across different layers (vertical lines)
-                        # Group points by angle across all layers
-                        angle_groups = {}  # angle_key -> list of (x, y, z, height, index)
-                        
-                        for idx, point_data in enumerate(self.scan_data):
-                            if len(point_data) >= 5:
-                                x, y, z, angle, height = point_data[:5]
-                                # Round angle to nearest degree for grouping
-                                angle_key = round(angle / angle_tolerance) * angle_tolerance
-                                if angle_key not in angle_groups:
-                                    angle_groups[angle_key] = []
-                                angle_groups[angle_key].append((x, y, z, height, idx))
-                        
-                        # For each angle group, connect points across layers (by height)
-                        for angle_key, points in angle_groups.items():
-                            if len(points) < 2:
-                                continue  # Need at least 2 points to connect
-                            
-                            # Sort points by height (Z)
-                            points_sorted = sorted(points, key=lambda p: p[3])  # Sort by height
-                            
-                            # Connect consecutive points in height order (vertical connections)
-                            for i in range(len(points_sorted) - 1):
-                                x1, y1, z1, h1, idx1 = points_sorted[i]
-                                x2, y2, z2, h2, idx2 = points_sorted[i + 1]
-                                
-                                # Only connect if heights are different (different layers)
-                                if abs(h2 - h1) > 0.01:  # Different layers
-                                    self.ax.plot([x1, x2], [y1, y2], [z1, z2],
-                                                'b-', alpha=0.4, linewidth=0.8)
-                    else:
-                        # Fallback: old format without angle metadata
-                        # Get unique Z heights (layers)
-                        unique_z = np.unique(z_coords)
-                        if len(unique_z) >= 2:
-                            # Group points by layer and angle (approximate)
-                            layers_by_angle = {}  # (z, angle_approx) -> (x, y, z)
-                            
-                            for i in range(len(x_coords)):
-                                z_val = z_coords[i]
-                                x_val = x_coords[i]
-                                y_val = y_coords[i]
-                                # Approximate angle from x, y position
-                                angle_approx = np.arctan2(y_val, x_val) * 180 / np.pi
-                                angle_key = round(angle_approx / 1.0) * 1.0  # Round to 1 degree
-                                
-                                layer_key = (z_val, angle_key)
-                                if layer_key not in layers_by_angle:
-                                    layers_by_angle[layer_key] = []
-                                layers_by_angle[layer_key].append((x_val, y_val, z_val))
-                            
-                            # Connect points with same angle across different layers
-                            angle_groups = {}  # angle -> list of (x, y, z) sorted by z
-                            for (z, angle), points in layers_by_angle.items():
-                                if angle not in angle_groups:
-                                    angle_groups[angle] = []
-                                angle_groups[angle].extend(points)
-                            
-                            # Sort each angle group by Z and connect
-                            for angle, points in angle_groups.items():
-                                if len(points) < 2:
-                                    continue
-                                points_sorted = sorted(points, key=lambda p: p[2])  # Sort by Z
-                                for i in range(len(points_sorted) - 1):
-                                    x1, y1, z1 = points_sorted[i]
-                                    x2, y2, z2 = points_sorted[i + 1]
-                                    if abs(z2 - z1) > 0.01:  # Different layers
-                                        self.ax.plot([x1, x2], [y1, y2], [z1, z2],
-                                                    'b-', alpha=0.4, linewidth=0.8)
-                except Exception as e:
-                    # If surface creation fails, continue with point cloud
-                    print(f"[VIZ] Surface mesh failed: {e}, using point cloud only")
 
-                # Always draw point cloud on top
+                            # Get points from both layers, sorted by angle
+                            layer1_points = sorted(layer_groups[height1], key=lambda p: p[3])  # Sort by angle
+                            layer2_points = sorted(layer_groups[height2], key=lambda p: p[3])  # Sort by angle
+
+                            print(
+                                f"[MESH] Layer {height1:.1f}mm ({len(layer1_points)} pts) <-> {height2:.1f}mm ({len(layer2_points)} pts)")
+
+                            # Step 4: Create triangulation between two layers
+                            # Strategy: For each point in layer1, find closest point in layer2
+                            # Then create triangles to connect them
+
+                            triangles_in_layer = 0
+
+                            # Method: Match points by angle proximity
+                            for i in range(len(layer1_points)):
+                                x1, y1, z1, angle1, idx1 = layer1_points[i]
+
+                                # Find closest point in layer2 by angle
+                                min_angle_diff = 360
+                                closest_j = -1
+                                for j in range(len(layer2_points)):
+                                    x2, y2, z2, angle2, idx2 = layer2_points[j]
+                                    angle_diff = abs(angle2 - angle1)
+                                    if angle_diff > 180:
+                                        angle_diff = 360 - angle_diff
+
+                                    if angle_diff < min_angle_diff:
+                                        min_angle_diff = angle_diff
+                                        closest_j = j
+
+                                # If found a close match (within 15 degrees)
+                                if closest_j >= 0 and min_angle_diff < 15:
+                                    x2, y2, z2, angle2, idx2 = layer2_points[closest_j]
+
+                                    # Also get next point in layer1 (for quad)
+                                    next_i = (i + 1) % len(layer1_points)
+                                    x1_next, y1_next, z1_next, angle1_next, idx1_next = layer1_points[next_i]
+
+                                    # Find matching point in layer2 for next point
+                                    min_angle_diff_next = 360
+                                    closest_j_next = -1
+                                    for j in range(len(layer2_points)):
+                                        x2_j, y2_j, z2_j, angle2_j, idx2_j = layer2_points[j]
+                                        angle_diff = abs(angle2_j - angle1_next)
+                                        if angle_diff > 180:
+                                            angle_diff = 360 - angle_diff
+
+                                        if angle_diff < min_angle_diff_next:
+                                            min_angle_diff_next = angle_diff
+                                            closest_j_next = j
+
+                                    # If both matches found, create quad (2 triangles)
+                                    if closest_j_next >= 0 and min_angle_diff_next < 15:
+                                        x2_next, y2_next, z2_next, angle2_next, idx2_next = layer2_points[
+                                            closest_j_next]
+
+                                        # Check if points are not too far apart (prevent connecting distant points)
+                                        # Maximum distance threshold: 50mm
+                                        dist1 = np.sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
+                                        dist2 = np.sqrt((x1_next - x1) ** 2 + (y1_next - y1) ** 2 + (z1_next - z1) ** 2)
+                                        dist3 = np.sqrt((x2_next - x2) ** 2 + (y2_next - y2) ** 2 + (z2_next - z2) ** 2)
+
+                                        if dist1 < 50 and dist2 < 50 and dist3 < 50:
+                                            # Create two triangles to form a quad
+                                            # Triangle 1: (p1_L1, p1_L2, p2_L1)
+                                            triangle1 = np.array([[x1, y1, z1],
+                                                                  [x2, y2, z2],
+                                                                  [x1_next, y1_next, z1_next]])
+
+                                            # Triangle 2: (p1_L2, p2_L2, p2_L1)
+                                            triangle2 = np.array([[x2, y2, z2],
+                                                                  [x2_next, y2_next, z2_next],
+                                                                  [x1_next, y1_next, z1_next]])
+
+                                            # Draw triangles
+                                            for triangle in [triangle1, triangle2]:
+                                                # Calculate normal vector to check if triangle is valid
+                                                v1 = triangle[1] - triangle[0]
+                                                v2 = triangle[2] - triangle[0]
+                                                normal = np.cross(v1, v2)
+
+                                                # Only draw if triangle has non-zero area
+                                                if np.linalg.norm(normal) > 0.01:
+                                                    poly = Poly3DCollection([triangle],
+                                                                            alpha=0.6,
+                                                                            facecolor='cyan',
+                                                                            edgecolor='blue',
+                                                                            linewidths=0.5)
+                                                    self.ax.add_collection3d(poly)
+                                                    triangles_in_layer += 1
+
+                            print(f"[MESH] Created {triangles_in_layer} triangles between layers")
+                            total_triangles += triangles_in_layer
+
+                        print(f"[MESH] Total triangles created: {total_triangles}")
+
+                        # Step 5: Add top and bottom caps (optional)
+                        # Top cap: connect all points in top layer
+                        if len(sorted_heights) >= 1:
+                            # Bottom cap
+                            bottom_layer = sorted(layer_groups[sorted_heights[0]], key=lambda p: p[3])
+                            if len(bottom_layer) >= 3:
+                                # Create fan triangulation from center
+                                center_x = np.mean([p[0] for p in bottom_layer])
+                                center_y = np.mean([p[1] for p in bottom_layer])
+                                center_z = sorted_heights[0]
+
+                                for i in range(len(bottom_layer)):
+                                    x1, y1, z1, _, _ = bottom_layer[i]
+                                    next_i = (i + 1) % len(bottom_layer)
+                                    x2, y2, z2, _, _ = bottom_layer[next_i]
+
+                                    triangle = np.array([[center_x, center_y, center_z],
+                                                         [x1, y1, z1],
+                                                         [x2, y2, z2]])
+
+                                    poly = Poly3DCollection([triangle],
+                                                            alpha=0.7,
+                                                            facecolor='lightgreen',
+                                                            edgecolor='green',
+                                                            linewidths=0.5)
+                                    self.ax.add_collection3d(poly)
+
+                            # Top cap
+                            top_layer = sorted(layer_groups[sorted_heights[-1]], key=lambda p: p[3])
+                            if len(top_layer) >= 3:
+                                center_x = np.mean([p[0] for p in top_layer])
+                                center_y = np.mean([p[1] for p in top_layer])
+                                center_z = sorted_heights[-1]
+
+                                for i in range(len(top_layer)):
+                                    x1, y1, z1, _, _ = top_layer[i]
+                                    next_i = (i + 1) % len(top_layer)
+                                    x2, y2, z2, _, _ = top_layer[next_i]
+
+                                    triangle = np.array([[center_x, center_y, center_z],
+                                                         [x1, y1, z1],
+                                                         [x2, y2, z2]])
+
+                                    poly = Poly3DCollection([triangle],
+                                                            alpha=0.7,
+                                                            facecolor='lightcoral',
+                                                            edgecolor='red',
+                                                            linewidths=0.5)
+                                    self.ax.add_collection3d(poly)
+
+                except Exception as e:
+                    print(f"[MESH] Error creating mesh: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Always draw point cloud on top for reference
                 if len(z_coords) > 0:
                     min_z = min(z_coords)
                     max_z = max(z_coords)
                     if max_z > min_z:
-                        # Normalize Z to 0-1 for colormap
                         z_normalized = [(z - min_z) / (max_z - min_z) for z in z_coords]
-                        # Use colormap: blue (low) to red (high)
                         self.ax.scatter(x_coords, y_coords, z_coords,
-                                       c=z_normalized, cmap='viridis',
-                                       s=3, alpha=0.9, edgecolors='none')
+                                        c=z_normalized, cmap='viridis',
+                                        s=8, alpha=0.8, edgecolors='black', linewidths=0.3)
                     else:
-                        # All points at same height
                         self.ax.scatter(x_coords, y_coords, z_coords,
-                                       c='blue', s=3, alpha=0.9, edgecolors='none')
-                
+                                        c='blue', s=8, alpha=0.8, edgecolors='black', linewidths=0.3)
+
                 # Set labels
                 self.ax.set_xlabel('X (mm)', fontsize=10)
                 self.ax.set_ylabel('Y (mm)', fontsize=10)
                 self.ax.set_zlabel('Z (mm)', fontsize=10)
-                self.ax.set_title(f'3D Scan Point Cloud - {len(self.scan_data)} points', fontsize=11, fontweight='bold')
-                
-                # Calculate bounds with some padding
+                self.ax.set_title(f'3D Scan Mesh - {len(self.scan_data)} points', fontsize=11, fontweight='bold')
+
+                # Calculate bounds with padding
                 if len(x_coords) > 0 and len(y_coords) > 0 and len(z_coords) > 0:
                     x_range = max(x_coords) - min(x_coords)
                     y_range = max(y_coords) - min(y_coords)
                     z_range = max(z_coords) - min(z_coords)
 
                     max_range = max(x_range, y_range, z_range) or 1
-                    padding = max_range * 0.1  # 10% padding
+                    padding = max_range * 0.1
 
                     mid_x = (max(x_coords) + min(x_coords)) / 2
                     mid_y = (max(y_coords) + min(y_coords)) / 2
                     mid_z = (max(z_coords) + min(z_coords)) / 2
-                    
-                    # Set limits with padding
-                    self.ax.set_xlim(mid_x - max_range/2 - padding, mid_x + max_range/2 + padding)
-                    self.ax.set_ylim(mid_y - max_range/2 - padding, mid_y + max_range/2 + padding)
-                    self.ax.set_zlim(mid_z - max_range/2 - padding, mid_z + max_range/2 + padding)
 
-                    # Set equal aspect ratio for better 3D view (true scale)
+                    self.ax.set_xlim(mid_x - max_range / 2 - padding, mid_x + max_range / 2 + padding)
+                    self.ax.set_ylim(mid_y - max_range / 2 - padding, mid_y + max_range / 2 + padding)
+                    self.ax.set_zlim(mid_z - max_range / 2 - padding, mid_z + max_range / 2 + padding)
+
                     try:
-                        self.ax.set_box_aspect([1, 1, 1])  # Equal aspect ratio
+                        self.ax.set_box_aspect([1, 1, 1])
                     except:
-                        # Fallback for older matplotlib versions
                         pass
                 else:
-                    # Default view if no data
                     self.ax.set_xlim(-10, 10)
                     self.ax.set_ylim(-10, 10)
                     self.ax.set_zlim(0, 20)
             else:
-                # Clear plot if no data
-                self.ax.set_xlabel('X (cm)', fontsize=10)
-                self.ax.set_ylabel('Y (cm)', fontsize=10)
-                self.ax.set_zlabel('Z (cm)', fontsize=10)
-                self.ax.set_title('3D Scan Point Cloud - No data', fontsize=11)
+                self.ax.set_xlabel('X (mm)', fontsize=10)
+                self.ax.set_ylabel('Y (mm)', fontsize=10)
+                self.ax.set_zlabel('Z (mm)', fontsize=10)
+                self.ax.set_title('3D Scan Mesh - No data', fontsize=11)
                 self.ax.set_xlim(-10, 10)
                 self.ax.set_ylim(-10, 10)
                 self.ax.set_zlim(0, 20)
-            
-            # Redraw canvas
+
             self.canvas.draw()
             self.canvas.flush_events()
-            
+
         except Exception as e:
             self.log_info(f"Visualization error: {e}")
             import traceback
